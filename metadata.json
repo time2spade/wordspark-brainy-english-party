@@ -1,0 +1,8 @@
+{
+  "name": "WordSpark: Brainy English Party",
+  "description": "Fast-paced English word party game for 1-12 players. Solo Sprint & Chain, P2P WebRTC rooms, and Pass-the-Phone Hot Potato Clash with instant dictionary validation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
