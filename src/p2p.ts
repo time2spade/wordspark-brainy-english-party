@@ -31,6 +31,7 @@ export interface LeaderboardEntry {
 export interface NetworkMessage {
   type: 
     | 'JOIN_REQUEST' 
+    | 'JOIN_ACCEPTED'
     | 'PLAYER_LIST_UPDATE' 
     | 'START_GAME' 
     | 'UPDATE_SCORE' 
@@ -240,6 +241,16 @@ export class P2PManager {
   public sendToHost(message: NetworkMessage) {
     if (this.hostConn && this.hostConn.open) {
       this.hostConn.send(message);
+    }
+  }
+
+  /**
+   * Host sends message directly to a specific connected peer
+   */
+  public sendToPeer(peerId: string, message: NetworkMessage) {
+    const conn = this.connections.get(peerId);
+    if (conn && conn.open) {
+      conn.send(message);
     }
   }
 

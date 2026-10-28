@@ -1,8 +1,9 @@
 /**
  * WordSpark Embedded English Dictionary & Lexicon
- * Contains 2,600+ verified common English words across multiple thematic categories.
- * Supports instant client-side lookup, constraint verification, and educational definition popups.
+ * Contains 3,500+ verified common English nouns and strict validation rules.
  */
+
+import { EMBEDDED_NOUNS_SET, KNOWN_NON_NOUNS_SET, checkPluralNounMatch } from './nounsData';
 
 export interface WordDefinition {
   word: string;
@@ -520,14 +521,91 @@ export const CURATED_DEFINITIONS: Record<string, WordDefinition> = {
   }
 };
 
+// In-memory cache for API-verified words
+const NOUN_API_CACHE = new Map<string, 'NOUN' | 'NOT_NOUN' | 'NOT_IN_DICT'>();
+
 /**
- * Returns whether a candidate word exists in our English lexicon.
+ * Strict Noun & Dictionary Verification:
+ * 1. Immediate 0ms check against 3,500+ embedded English nouns.
+ * 2. Regular and irregular plural noun forms (e.g., CATS, COMPUTERS, STATIONS, LEAVES, CHILDREN).
+ * 3. Immediate rejection of known non-nouns (verbs, adjectives, adverbs, prepositions).
+ * 4. Asynchronous fallback against the Free Dictionary API (https://api.dictionaryapi.dev/api/v2/entries/en/{word}).
+ */
+export async function verifyNounStrictly(clean: string): Promise<{ valid: boolean; reason?: string }> {
+  // 1. Direct hit in 3,500+ embedded nouns
+  if (EMBEDDED_NOUNS_SET.has(clean)) {
+    return { valid: true };
+  }
+
+  // 2. Plural forms of nouns (e.g. CATS, COMPUTERS, CITIES, LEAVES, CHILDREN)
+  if (checkPluralNounMatch(clean)) {
+    return { valid: true };
+  }
+
+  // 3. Known non-nouns (verbs, adjectives, adverbs, prepositions)
+  if (KNOWN_NON_NOUNS_SET.has(clean)) {
+    return { valid: false, reason: "⚠️ Only English NOUNS are allowed!" };
+  }
+
+  // 4. In-memory API lookup cache
+  if (NOUN_API_CACHE.has(clean)) {
+    const cached = NOUN_API_CACHE.get(clean);
+    if (cached === 'NOUN') return { valid: true };
+    if (cached === 'NOT_NOUN') return { valid: false, reason: "⚠️ Only English NOUNS are allowed!" };
+    return { valid: false, reason: "❌ Not in dictionary!" };
+  }
+
+  // 5. Asynchronous fallback against Free Dictionary API
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2000);
+    const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${clean.toLowerCase()}`, {
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+
+    if (res.status === 404) {
+      NOUN_API_CACHE.set(clean, 'NOT_IN_DICT');
+      return { valid: false, reason: "❌ Not in dictionary!" };
+    }
+
+    if (res.ok) {
+      const data = await res.json();
+      const isNoun = Array.isArray(data) && data.some((entry: any) =>
+        entry.meanings?.some((m: any) => m.partOfSpeech?.toLowerCase() === 'noun')
+      );
+
+      if (isNoun) {
+        NOUN_API_CACHE.set(clean, 'NOUN');
+        EMBEDDED_NOUNS_SET.add(clean);
+        return { valid: true };
+      } else {
+        NOUN_API_CACHE.set(clean, 'NOT_NOUN');
+        return { valid: false, reason: "⚠️ Only English NOUNS are allowed!" };
+      }
+    }
+  } catch (e) {
+    // Timeout or network offline
+  }
+
+  // 6. Strict rejection if not verified as noun
+  return { valid: false, reason: "❌ Not in dictionary!" };
+}
+
+/**
+ * Returns whether a candidate word exists as a valid noun in our lexicon.
  */
 export function isValidWord(word: string): boolean {
   if (!word) return false;
   const clean = word.trim().toUpperCase();
-  if (clean.length < 2) return false;
-  return DICTIONARY_SET.has(clean);
+  if (clean.length < 3) return false;
+  if (!/^[A-Z]+$/.test(clean)) return false;
+
+  // Direct hit or plural in noun dataset
+  if (EMBEDDED_NOUNS_SET.has(clean) || checkPluralNounMatch(clean)) return true;
+  if (NOUN_API_CACHE.get(clean) === 'NOUN') return true;
+
+  return false;
 }
 
 /**
@@ -778,60 +856,167 @@ export interface WordSprintScore {
 }
 
 /**
- * Generates 4 shared challenge prompts for all players in the 120s sprint.
+ * Mulberry32 32-bit pseudo-random number generator
+ * Produces deterministic sequence for any integer seed.
  */
-export function generateSharedChallengeBoard(seedNum?: number): ChallengePrompt[] {
-  // Deterministic or randomized board
-  const prefixes = [
-    { prefix: "PL", desc: "Words starting with 'PL' (e.g. PLAY, PLANET, PLATE)" },
-    { prefix: "ST", desc: "Words starting with 'ST' (e.g. STORM, STONE, STAR)" },
-    { prefix: "CR", desc: "Words starting with 'CR' (e.g. CRANE, CROWD, CRAFT)" },
-    { prefix: "BR", desc: "Words starting with 'BR' (e.g. BRAIN, BREAD, BREEZE)" },
-    { prefix: "TR", desc: "Words starting with 'TR' (e.g. TRAIN, TRACK, TREE)" },
-    { prefix: "FL", desc: "Words starting with 'FL' (e.g. FLAME, FLASH, FLOOR)" },
-    { prefix: "SP", desc: "Words starting with 'SP' (e.g. SPARK, SPACE, SPEED)" },
-    { prefix: "GR", desc: "Words starting with 'GR' (e.g. GRAPE, GREEN, GRASP)" },
-    { prefix: "CH", desc: "Words starting with 'CH' (e.g. CHIP, CHAIR, CHEST)" },
-    { prefix: "SH", desc: "Words starting with 'SH' (e.g. SHINE, SHIELD, SHARK)" }
-  ];
+export function mulberry32(seed: number) {
+  let s = seed >>> 0;
+  return function() {
+    let t = s += 0x6D2B79F5;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
-  const substrings = [
-    { sub: "IGHT", desc: "Contains 'IGHT' (e.g. LIGHT, BRIGHT, NIGHT, SIGHT)" },
-    { sub: "OUND", desc: "Contains 'OUND' (e.g. SOUND, ROUND, GROUND, BOUND)" },
-    { sub: "EER", desc: "Contains 'EER' (e.g. CHEER, PEER, ENGINEER, STEER)" },
-    { sub: "ART", desc: "Contains 'ART' (e.g. SMART, START, EARTH, PARTY)" },
-    { sub: "ALL", desc: "Contains 'ALL' (e.g. BALL, CALL, SMALL, FALL)" },
-    { sub: "ING", desc: "Contains 'ING' (e.g. SPRING, KING, RING, WING)" },
-    { sub: "ENT", desc: "Contains 'ENT' (e.g. TALENT, CLIENT, TENT, SILENT)" },
-    { sub: "OOK", desc: "Contains 'OOK' (e.g. BOOK, COOK, LOOK, HOOK)" },
-    { sub: "EAT", desc: "Contains 'EAT' (e.g. WHEAT, MEAT, GREAT, FEAST)" }
-  ];
+/**
+ * Converts a date string 'YYYY-MM-DD' into an integer seed
+ */
+export function dateStringToSeed(dateStr: string): number {
+  let hash = 0;
+  for (let i = 0; i < dateStr.length; i++) {
+    const char = dateStr.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash |= 0;
+  }
+  return Math.abs(hash) || 20261027;
+}
 
+/**
+ * Returns formatted date string 'YYYY-MM-DD'
+ */
+export function getTodayDateString(): string {
+  const d = new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+export const PREFIX_LIST = [
+  { prefix: "PL", desc: "Words starting with 'PL'" },
+  { prefix: "ST", desc: "Words starting with 'ST'" },
+  { prefix: "CR", desc: "Words starting with 'CR'" },
+  { prefix: "BR", desc: "Words starting with 'BR'" },
+  { prefix: "TR", desc: "Words starting with 'TR'" },
+  { prefix: "FL", desc: "Words starting with 'FL'" },
+  { prefix: "SP", desc: "Words starting with 'SP'" },
+  { prefix: "GR", desc: "Words starting with 'GR'" },
+  { prefix: "CH", desc: "Words starting with 'CH'" },
+  { prefix: "SH", desc: "Words starting with 'SH'" },
+  { prefix: "BL", desc: "Words starting with 'BL'" },
+  { prefix: "CL", desc: "Words starting with 'CL'" }
+];
+
+export const SUBSTRING_LIST = [
+  { sub: "IGHT", desc: "Contains 'IGHT'" },
+  { sub: "OUND", desc: "Contains 'OUND'" },
+  { sub: "EER", desc: "Contains 'EER'" },
+  { sub: "ART", desc: "Contains 'ART'" },
+  { sub: "ALL", desc: "Contains 'ALL'" },
+  { sub: "ING", desc: "Contains 'ING'" },
+  { sub: "ENT", desc: "Contains 'ENT'" },
+  { sub: "OOK", desc: "Contains 'OOK'" },
+  { sub: "EAT", desc: "Contains 'EAT'" },
+  { sub: "ACE", desc: "Contains 'ACE'" }
+];
+
+/**
+ * Generates the EXACT same deterministic challenges for everyone playing on a specific date.
+ */
+export function generateDailyChallengeBoard(dateStr: string = getTodayDateString()): {
+  challenges: ChallengePrompt[];
+  bonusLetter: string;
+  targetCategory: string;
+} {
+  const seed = dateStringToSeed(dateStr);
+  const rng = mulberry32(seed);
+
+  const pIdx = Math.floor(rng() * PREFIX_LIST.length);
+  const sIdx = Math.floor(rng() * SUBSTRING_LIST.length);
   const categories = Object.keys(THEMATIC_CATEGORIES);
+  const cIdx = Math.floor(rng() * categories.length);
+  const targetCategory = categories[cIdx];
 
-  // Pick one from each slot
-  const pIdx = Math.floor(Math.random() * prefixes.length);
-  const sIdx = Math.floor(Math.random() * substrings.length);
-  const cIdx = Math.floor(Math.random() * categories.length);
-  const chosenCat = categories[cIdx];
+  const letters = "ABCDEFGHILMNORSTUW";
+  const bonusLetter = letters.charAt(Math.floor(rng() * letters.length));
 
   const prompt1: ChallengePrompt = {
-    id: `pref-${prefixes[pIdx].prefix}`,
-    title: `Starts with "${prefixes[pIdx].prefix}"`,
-    description: prefixes[pIdx].desc,
+    id: `daily-prefix-${PREFIX_LIST[pIdx].prefix}`,
+    title: `Starts with "${PREFIX_LIST[pIdx].prefix}"`,
+    description: PREFIX_LIST[pIdx].desc,
     type: 'STARTS_WITH',
-    value: prefixes[pIdx].prefix,
-    badge: `Start: ${prefixes[pIdx].prefix}`,
+    value: PREFIX_LIST[pIdx].prefix,
+    badge: `Prefix: ${PREFIX_LIST[pIdx].prefix}`,
     bonus: 20
   };
 
   const prompt2: ChallengePrompt = {
-    id: `sub-${substrings[sIdx].sub}`,
-    title: `Contains "${substrings[sIdx].sub}"`,
-    description: substrings[sIdx].desc,
+    id: `daily-sub-${SUBSTRING_LIST[sIdx].sub}`,
+    title: `Contains "${SUBSTRING_LIST[sIdx].sub}"`,
+    description: SUBSTRING_LIST[sIdx].desc,
     type: 'CONTAINS',
-    value: substrings[sIdx].sub,
-    badge: `Has: ${substrings[sIdx].sub}`,
+    value: SUBSTRING_LIST[sIdx].sub,
+    badge: `Has: ${SUBSTRING_LIST[sIdx].sub}`,
+    bonus: 20
+  };
+
+  const prompt3: ChallengePrompt = {
+    id: `daily-cat-${targetCategory}`,
+    title: `Topic: ${targetCategory}`,
+    description: `Words in the ${targetCategory} category`,
+    type: 'CATEGORY',
+    value: targetCategory,
+    badge: `Topic: ${targetCategory}`,
+    bonus: 20
+  };
+
+  const prompt4: ChallengePrompt = {
+    id: `daily-bonus-${bonusLetter}`,
+    title: `Daily Bonus Letter "${bonusLetter}"`,
+    description: `Contains the letter "${bonusLetter}" anywhere`,
+    type: 'CONTAINS',
+    value: bonusLetter,
+    badge: `Letter: ${bonusLetter}`,
+    bonus: 20
+  };
+
+  return {
+    challenges: [prompt1, prompt2, prompt3, prompt4],
+    bonusLetter,
+    targetCategory
+  };
+}
+
+/**
+ * Generates 4 shared challenge prompts for all players in the 120s sprint.
+ */
+export function generateSharedChallengeBoard(seedNum?: number): ChallengePrompt[] {
+  const rng = seedNum !== undefined ? mulberry32(seedNum) : Math.random;
+
+  const pIdx = Math.floor(rng() * PREFIX_LIST.length);
+  const sIdx = Math.floor(rng() * SUBSTRING_LIST.length);
+  const categories = Object.keys(THEMATIC_CATEGORIES);
+  const cIdx = Math.floor(rng() * categories.length);
+  const chosenCat = categories[cIdx];
+
+  const prompt1: ChallengePrompt = {
+    id: `pref-${PREFIX_LIST[pIdx].prefix}`,
+    title: `Starts with "${PREFIX_LIST[pIdx].prefix}"`,
+    description: PREFIX_LIST[pIdx].desc,
+    type: 'STARTS_WITH',
+    value: PREFIX_LIST[pIdx].prefix,
+    badge: `Start: ${PREFIX_LIST[pIdx].prefix}`,
+    bonus: 20
+  };
+
+  const prompt2: ChallengePrompt = {
+    id: `sub-${SUBSTRING_LIST[sIdx].sub}`,
+    title: `Contains "${SUBSTRING_LIST[sIdx].sub}"`,
+    description: SUBSTRING_LIST[sIdx].desc,
+    type: 'CONTAINS',
+    value: SUBSTRING_LIST[sIdx].sub,
+    badge: `Has: ${SUBSTRING_LIST[sIdx].sub}`,
     bonus: 20
   };
 
@@ -865,17 +1050,32 @@ export function generateSharedChallengeBoard(seedNum?: number): ChallengePrompt[
  * - 7+ letter word = 50 pts
  * - Category / Constraint match bonus = +20 pts
  */
-export function evaluateWordRush(
+export async function evaluateWordRush(
   candidateWord: string,
   challenges: ChallengePrompt[],
   existingHistory: string[]
-): WordSprintScore {
+): Promise<WordSprintScore> {
   const clean = candidateWord.trim().toUpperCase();
 
+  // 1. Only English alphabetic characters
+  if (!/^[A-Z]+$/.test(clean)) {
+    return {
+      valid: false,
+      reason: "Word must contain English letters only!",
+      word: clean,
+      baseScore: 0,
+      bonusScore: 0,
+      totalScore: 0,
+      matchedChallengeIds: [],
+      matchedChallengeTitles: []
+    };
+  }
+
+  // 2. Length validation
   if (clean.length < 3) {
     return {
       valid: false,
-      reason: "Words must be at least 3 letters long!",
+      reason: `"${clean}" is too short! Minimum 3 letters required.`,
       word: clean,
       baseScore: 0,
       bonusScore: 0,
@@ -885,10 +1085,11 @@ export function evaluateWordRush(
     };
   }
 
-  if (existingHistory.includes(clean)) {
+  // 3. Duplicate check in round history (case-insensitive)
+  if (existingHistory.some(w => w.trim().toUpperCase() === clean)) {
     return {
       valid: false,
-      reason: `"${clean}" was already scored in this round!`,
+      reason: `"${clean}" was already used in this round!`,
       word: clean,
       baseScore: 0,
       bonusScore: 0,
@@ -898,10 +1099,12 @@ export function evaluateWordRush(
     };
   }
 
-  if (!isValidWord(clean)) {
+  // 4. Strict Noun & Dictionary validation
+  const nounCheck = await verifyNounStrictly(clean);
+  if (!nounCheck.valid) {
     return {
       valid: false,
-      reason: `"${clean}" is not in the recognized English dictionary!`,
+      reason: nounCheck.reason || "❌ Not in dictionary!",
       word: clean,
       baseScore: 0,
       bonusScore: 0,
@@ -970,5 +1173,39 @@ export function evaluateWordRush(
     matchedChallengeIds,
     matchedChallengeTitles
   };
+}
+
+/**
+ * Finds an eligible noun matching active challenges for the Rewarded Ad hint system
+ */
+export function findHintNoun(challenges: ChallengePrompt[], alreadySubmitted: string[]): string {
+  const submittedSet = new Set(alreadySubmitted.map(w => w.trim().toUpperCase()));
+  
+  // 1. Try to find a noun from THEMATIC_CATEGORIES
+  for (const c of challenges) {
+    if (c.type === 'CATEGORY' && THEMATIC_CATEGORIES[String(c.value)]) {
+      const candidates = THEMATIC_CATEGORIES[String(c.value)].filter(w => !submittedSet.has(w));
+      if (candidates.length > 0) {
+        return candidates[Math.floor(Math.random() * candidates.length)];
+      }
+    }
+  }
+
+  // 2. Check prefix or substring matching nouns from embedded nouns set
+  for (const noun of Array.from(EMBEDDED_NOUNS_SET)) {
+    if (noun.length >= 3 && !submittedSet.has(noun)) {
+      for (const c of challenges) {
+        if (c.type === 'STARTS_WITH' && noun.startsWith(String(c.value))) return noun;
+        if (c.type === 'CONTAINS' && noun.includes(String(c.value))) return noun;
+      }
+    }
+  }
+
+  // 3. Fallback to any valid common noun
+  for (const noun of Array.from(EMBEDDED_NOUNS_SET)) {
+    if (noun.length >= 4 && !submittedSet.has(noun)) return noun;
+  }
+
+  return "PLANET";
 }
 

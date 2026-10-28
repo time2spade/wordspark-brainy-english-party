@@ -6,7 +6,7 @@ import {
   VolumeX, 
   Sparkles, 
   Users, 
-  User, 
+  Calendar, 
   Radio, 
   RotateCcw, 
   BookOpen, 
@@ -21,14 +21,26 @@ import {
   Play,
   Award,
   Medal,
-  ChevronRight
+  ChevronRight,
+  LogOut,
+  LogIn,
+  RefreshCw,
+  CalendarDays,
+  Target,
+  ShieldCheck,
+  Star,
+  FlameKindling,
+  Home,
+  ArrowLeft
 } from 'lucide-react';
 
 import { 
   isValidWord, 
   getWordDefinition, 
+  generateDailyChallengeBoard,
   generateSharedChallengeBoard, 
   evaluateWordRush, 
+  getTodayDateString,
   ChallengePrompt, 
   WordSprintScore,
   WordDefinition 
@@ -42,9 +54,16 @@ import {
   generateRoomCode, 
   NetworkMessage 
 } from './p2p';
+import { 
+  firebaseService, 
+  UserProfile, 
+  DailyLeaderboardEntry 
+} from './firebase';
+import { AdBanner } from './components/AdComponents';
+import { AffiliateModal } from './components/AffiliateModal';
 
-type GameMode = 'MENU' | 'SOLO' | 'P2P_HOST' | 'P2P_GUEST';
-type PlayState = 'LOBBY' | 'PLAYING' | 'GAME_OVER';
+type AppNavTab = 'HOME' | 'DAILY_RANKINGS' | 'PARTY_RUSH';
+type GamePlayState = 'LOBBY' | 'PLAYING' | 'GAME_OVER';
 
 interface ScoredWordEntry {
   word: string;
@@ -56,40 +75,56 @@ interface ScoredWordEntry {
 }
 
 export default function App() {
-  // Navigation & Sound
-  const [gameMode, setGameMode] = useState<GameMode>('MENU');
-  const [playState, setPlayState] = useState<PlayState>('LOBBY');
+  // Navigation & User
+  const [activeTab, setActiveTab] = useState<AppNavTab>('HOME');
+  const [playState, setPlayState] = useState<GamePlayState>('LOBBY');
+  const [gameModeType, setGameModeType] = useState<'DAILY_QUEST' | 'PARTY_RUSH'>('DAILY_QUEST');
+  const [user, setUser] = useState<UserProfile | null>(firebaseService.getCurrentUser());
   const [isMuted, setIsMuted] = useState<boolean>(sounds.isMuted);
+  const [isSigningIn, setIsSigningIn] = useState<boolean>(false);
 
   // Modals
   const [showDefinitionModal, setShowDefinitionModal] = useState<WordDefinition | null>(null);
   const [showRulesModal, setShowRulesModal] = useState<boolean>(false);
-  const [showHighScoresModal, setShowHighScoresModal] = useState<boolean>(false);
+  const [showSignInModal, setShowSignInModal] = useState<boolean>(false);
+  const [showAffiliateModal, setShowAffiliateModal] = useState<boolean>(false);
   const [lexiconSearchQuery, setLexiconSearchQuery] = useState<string>('');
+  const [authErrorDetail, setAuthErrorDetail] = useState<{
+    code: string;
+    title: string;
+    message: string;
+    domain?: string;
+  } | null>(null);
+  const [customAccountName, setCustomAccountName] = useState<string>('');
 
-  // 120s Shared Round State
-  const [roundDuration] = useState<number>(120); // 120 seconds (2 minutes)
+  // Daily Challenge State
+  const todayDateStr = useMemo(() => getTodayDateString(), []);
+  const [selectedRankingDate, setSelectedRankingDate] = useState<string>(todayDateStr);
+  const [dailyBoardData, setDailyBoardData] = useState(() => generateDailyChallengeBoard(todayDateStr));
+  const [isOfficialAttempt, setIsOfficialAttempt] = useState<boolean>(true);
+  const [hasCompletedToday, setHasCompletedToday] = useState<boolean>(false);
+  const [previousDailyScore, setPreviousDailyScore] = useState<number | null>(null);
+
+  // Midnight Countdown
+  const [timeUntilReset, setTimeUntilReset] = useState<string>('00h 00m 00s');
+
+  // Active Game State
   const [timeLeft, setTimeLeft] = useState<number>(120);
-  const [challenges, setChallenges] = useState<ChallengePrompt[]>([]);
-  
-  // Local Player Word & Score State
+  const [activeChallenges, setActiveChallenges] = useState<ChallengePrompt[]>([]);
   const [currentInput, setCurrentInput] = useState<string>('');
-  const [myScore, setMyScore] = useState<number>(0);
-  const [myScoredWords, setMyScoredWords] = useState<ScoredWordEntry[]>([]);
+  const [currentScore, setCurrentScore] = useState<number>(0);
+  const [scoredWords, setScoredWords] = useState<ScoredWordEntry[]>([]);
   const [inputFeedback, setInputFeedback] = useState<{ message: string; isError: boolean } | null>(null);
   const [shakingInput, setShakingInput] = useState<boolean>(false);
+  const [isEvaluatingWord, setIsEvaluatingWord] = useState<boolean>(false);
 
-  // High Scores in localStorage
-  const [soloHighScores, setSoloHighScores] = useState<number[]>(() => {
-    try {
-      const saved = localStorage.getItem('wordrush_solo_highscores');
-      return saved ? JSON.parse(saved) : [480, 360, 220];
-    } catch {
-      return [480, 360, 220];
-    }
-  });
+  // Leaderboard Data
+  const [dailyLeaderboard, setDailyLeaderboard] = useState<DailyLeaderboardEntry[]>([]);
+  const [isLoadingLeaderboard, setIsLoadingLeaderboard] = useState<boolean>(false);
 
-  // Multiplayer / P2P State
+  // Multiplayer P2P State
+  const [p2pMode, setP2PMode] = useState<'IDLE' | 'HOST' | 'GUEST'>('IDLE');
+  const [isGuestConnected, setIsGuestConnected] = useState<boolean>(false);
   const [roomCode, setRoomCode] = useState<string>('');
   const [joinCodeInput, setJoinCodeInput] = useState<string>('');
   const [playerName, setPlayerName] = useState<string>('WordNinja');
@@ -103,31 +138,190 @@ export default function App() {
   const wordInputRef = useRef<HTMLInputElement>(null);
   const timerIntervalRef = useRef<any>(null);
 
-  // Toggle Sound Mute
+  // Listen to Auth state changes
+  useEffect(() => {
+    const unsub = firebaseService.onAuthChange(currUser => {
+      setUser(currUser);
+      if (currUser) {
+        setPlayerName(currUser.displayName);
+        checkTodayCompletion(currUser.uid);
+      }
+    });
+    return () => unsub();
+  }, [todayDateStr]);
+
+  const checkTodayCompletion = (uid: string) => {
+    const completed = firebaseService.hasCompletedOfficialRun(uid, todayDateStr);
+    setHasCompletedToday(completed);
+    if (completed) {
+      const savedScore = localStorage.getItem(`wordspark_score_${todayDateStr}_${uid}`);
+      setPreviousDailyScore(savedScore ? parseInt(savedScore, 10) : null);
+    }
+  };
+
+  // Midnight Countdown ticker
+  useEffect(() => {
+    const updateMidnightCountdown = () => {
+      const now = new Date();
+      const tomorrow = new Date(now);
+      tomorrow.setHours(24, 0, 0, 0);
+      const diffSecs = Math.max(0, Math.floor((tomorrow.getTime() - now.getTime()) / 1000));
+      const h = Math.floor(diffSecs / 3600);
+      const m = Math.floor((diffSecs % 3600) / 60);
+      const s = diffSecs % 60;
+      setTimeUntilReset(`${h.toString().padStart(2, '0')}h ${m.toString().padStart(2, '0')}m ${s.toString().padStart(2, '0')}s`);
+    };
+
+    updateMidnightCountdown();
+    const interval = setInterval(updateMidnightCountdown, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Fetch Leaderboard for Selected Date
+  const loadLeaderboard = async (dateStr: string) => {
+    setIsLoadingLeaderboard(true);
+    try {
+      const entries = await firebaseService.fetchDailyLeaderboard(dateStr, user?.uid);
+      setDailyLeaderboard(entries);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsLoadingLeaderboard(false);
+    }
+  };
+
+  useEffect(() => {
+    // Initial fetch for today's leaderboard so home screen previews top scores
+    loadLeaderboard(selectedRankingDate);
+  }, [selectedRankingDate, user]);
+
+  // Best Word for local player
+  const myBestWord = useMemo(() => {
+    if (scoredWords.length === 0) return { word: '—', totalScore: 0 };
+    return [...scoredWords].sort((a, b) => b.totalScore - a.totalScore)[0];
+  }, [scoredWords]);
+
+  // User's own entry in daily leaderboard
+  const myLeaderboardEntry = useMemo(() => {
+    if (!user) return null;
+    return dailyLeaderboard.find(entry => entry.uid === user.uid);
+  }, [dailyLeaderboard, user]);
+
+  // Owner/Admin Authorization: Only T2Spade@gmail.com or ?admin=true sees the affiliate manager
+  const [adminModeKey, setAdminModeKey] = useState<number>(0);
+  const isOwnerAdmin = useMemo(() => {
+    if (user?.email && user.email.toLowerCase() === 't2spade@gmail.com') {
+      return true;
+    }
+    if (typeof window !== 'undefined' && window.location) {
+      const search = window.location.search.toLowerCase();
+      if (search.includes('admin=true') || search.includes('partner=true')) {
+        try {
+          localStorage.setItem('wordspark_admin_mode', 'true');
+        } catch (e) {}
+        return true;
+      }
+    }
+    try {
+      if (localStorage.getItem('wordspark_admin_mode') === 'true') {
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }, [user, adminModeKey]);
+
+  // Audio Toggle
   const handleToggleMute = () => {
     const next = sounds.toggleMute();
     setIsMuted(next);
   };
 
-  // Best Word for local player
-  const myBestWord = useMemo(() => {
-    if (myScoredWords.length === 0) return { word: '—', totalScore: 0 };
-    return [...myScoredWords].sort((a, b) => b.totalScore - a.totalScore)[0];
-  }, [myScoredWords]);
+  // Direct Google Sign In
+  const handleDirectGoogleSignIn = async () => {
+    sounds.playClick();
+    setIsSigningIn(true);
+    setAuthErrorDetail(null);
+    try {
+      const profile = await firebaseService.signInWithGoogle();
+      triggerInputSuccess(`Welcome, ${profile.displayName}!`);
+      setShowSignInModal(false);
+    } catch (err: any) {
+      if (err.message && err.message.includes('popup was closed')) {
+        return;
+      }
+      const code = err.code || '';
+      const currentHost = window.location.hostname;
+      let title = 'Google Sign-In Notice';
+      let msg = 'Could not authenticate with Google at this time.';
+      let domain: string | undefined = undefined;
+
+      if (code === 'auth/unauthorized-domain' || (err.message && err.message.includes('unauthorized domain'))) {
+        title = 'Firebase Domain Authorization Required';
+        msg = `Domain "${currentHost}" is not yet authorized in Firebase Console. Add it in Firebase Console > Authentication > Settings > Authorized Domains, or play immediately with Instant Account below!`;
+        domain = currentHost;
+      } else if (code === 'auth/popup-blocked' || (err.message && err.message.includes('popup'))) {
+        title = 'Popup Blocked by Browser';
+        msg = 'Your browser or iframe preview blocked the sign-in popup. Enable popups or continue with Instant Account below.';
+      } else if (code === 'auth/operation-not-allowed') {
+        title = 'Google Provider Not Enabled';
+        msg = 'Google provider is not enabled in Firebase Console (Authentication > Sign-in method). Use Instant Account below.';
+      } else {
+        msg = err.message || 'Google sign-in encountered an issue. You can use Instant Account below.';
+      }
+
+      setAuthErrorDetail({ code, title, message: msg, domain });
+      setShowSignInModal(true);
+      triggerInputShake(title);
+    } finally {
+      setIsSigningIn(false);
+    }
+  };
+
+  const handleInstantSignIn = (nameToUse?: string) => {
+    sounds.playClick();
+    const finalName = (nameToUse && nameToUse.trim()) || (customAccountName && customAccountName.trim()) || 'Player';
+    const profile = firebaseService.signInAsDemoUser(finalName);
+    triggerInputSuccess(`Signed in as ${profile.displayName}!`);
+    setShowSignInModal(false);
+    setAuthErrorDetail(null);
+  };
+
+  const handleSignOut = async () => {
+    sounds.playClick();
+    await firebaseService.signOutUser();
+    setUser(null);
+    triggerInputSuccess('Signed out successfully.');
+  };
 
   // ----------------------------------------------------
-  // SOLO MODE (1 PLAYER)
+  // DAILY CHALLENGE START
   // ----------------------------------------------------
-  const startSoloSprint = () => {
+  const handleStartDailyChallenge = () => {
     sounds.playClick();
-    setGameMode('SOLO');
-    const newChallenges = generateSharedChallengeBoard();
-    setChallenges(newChallenges);
-    setMyScore(0);
-    setMyScoredWords([]);
+
+    // If user is not logged in, prompt modal!
+    if (!user) {
+      setShowSignInModal(true);
+      return;
+    }
+
+    launchDailyGame();
+  };
+
+  const launchDailyGame = () => {
+    setGameModeType('DAILY_QUEST');
+    const board = generateDailyChallengeBoard(todayDateStr);
+    setDailyBoardData(board);
+    setActiveChallenges(board.challenges);
+    
+    const uid = user ? user.uid : 'guest';
+    const alreadyDone = user ? firebaseService.hasCompletedOfficialRun(uid, todayDateStr) : false;
+    setIsOfficialAttempt(!alreadyDone);
+
+    setCurrentScore(0);
+    setScoredWords([]);
     setCurrentInput('');
-    setTimeLeft(roundDuration);
-    setLiveLeaderboard([]);
+    setTimeLeft(120);
     setPlayState('PLAYING');
 
     setTimeout(() => wordInputRef.current?.focus(), 150);
@@ -149,7 +343,6 @@ export default function App() {
           handleRoundFinished();
           return 0;
         }
-        // Final 10 seconds: urgent audio ticker
         if (prev <= 10) {
           sounds.playTick(true);
         }
@@ -160,25 +353,33 @@ export default function App() {
     return () => {
       if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
     };
-  }, [playState, myScore]);
+  }, [playState, currentScore]);
 
   // Round Over Trigger
-  const handleRoundFinished = () => {
+  const handleRoundFinished = async () => {
     sounds.playWhistle();
     setPlayState('GAME_OVER');
-    confetti({ particleCount: 90, spread: 70, origin: { y: 0.6 } });
+    confetti({ particleCount: 110, spread: 80, origin: { y: 0.6 } });
 
-    // Save Solo High Score
-    if (gameMode === 'SOLO') {
-      setSoloHighScores(prev => {
-        const updated = [...prev, myScore].sort((a, b) => b - a).slice(0, 5);
-        localStorage.setItem('wordrush_solo_highscores', JSON.stringify(updated));
-        return updated;
+    // Record score if Daily Quest & Official Run
+    if (gameModeType === 'DAILY_QUEST' && isOfficialAttempt && user) {
+      const best = myBestWord.word !== '—' ? myBestWord.word : 'NONE';
+      await firebaseService.submitDailyScore(todayDateStr, {
+        uid: user.uid,
+        displayName: user.displayName,
+        photoURL: user.photoURL,
+        score: currentScore,
+        wordCount: scoredWords.length,
+        bestWord: best,
+        timestamp: Date.now()
       });
+      setHasCompletedToday(true);
+      setPreviousDailyScore(currentScore);
+      loadLeaderboard(todayDateStr);
     }
 
-    // If Host, broadcast END_GAME
-    if (gameMode === 'P2P_HOST') {
+    // If Host in P2P mode, broadcast END_GAME
+    if (gameModeType === 'PARTY_RUSH' && p2pMode === 'HOST') {
       p2pManagerRef.current?.broadcast({
         type: 'END_GAME',
         payload: { leaderboard: liveLeaderboard }
@@ -187,28 +388,29 @@ export default function App() {
   };
 
   // ----------------------------------------------------
-  // WORD SUBMISSION & INSTANT LOCAL SCORING
+  // WORD SUBMISSION & SCORING
   // ----------------------------------------------------
-  const handleWordSubmit = (e: React.FormEvent) => {
+  const handleWordSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (playState !== 'PLAYING') return;
+    if (playState !== 'PLAYING' || isEvaluatingWord) return;
 
     const candidate = currentInput.trim().toUpperCase();
     if (!candidate) return;
 
-    const existingWords = myScoredWords.map(w => w.word);
-    const result: WordSprintScore = evaluateWordRush(candidate, challenges, existingWords);
+    setIsEvaluatingWord(true);
+    try {
+      const existingWords = scoredWords.map(w => w.word);
+      const result: WordSprintScore = await evaluateWordRush(candidate, activeChallenges, existingWords);
 
-    if (!result.valid) {
-      sounds.playError();
-      triggerInputShake(result.reason || 'Invalid word!');
-      return;
-    }
+      if (!result.valid) {
+        sounds.playError();
+        triggerInputShake(result.reason || 'Invalid word!');
+        return;
+      }
 
-    // Positive chord sound on valid word score!
-    sounds.playSuccess();
+      sounds.playSuccess();
 
-    const newScore = myScore + result.totalScore;
+    const newScore = currentScore + result.totalScore;
     const newEntry: ScoredWordEntry = {
       word: result.word,
       baseScore: result.baseScore,
@@ -218,33 +420,35 @@ export default function App() {
       timestamp: Date.now()
     };
 
-    const updatedWords = [newEntry, ...myScoredWords];
-    setMyScore(newScore);
-    setMyScoredWords(updatedWords);
+    const updatedWords = [newEntry, ...scoredWords];
+    setCurrentScore(newScore);
+    setScoredWords(updatedWords);
     setCurrentInput('');
 
-    // Feedback message highlighting score & bonuses
     const bonusText = result.bonusScore > 0 ? ` (+${result.bonusScore} Match Bonus!)` : '';
     triggerInputSuccess(`+${result.totalScore} pts!${bonusText}`);
 
-    // Determine current best word
-    const bestScored = [...updatedWords].sort((a, b) => b.totalScore - a.totalScore)[0];
-
-    // Transmit score to network if multiplayer
-    if (gameMode === 'P2P_GUEST') {
-      p2pManagerRef.current?.sendToHost({
-        type: 'UPDATE_SCORE',
-        payload: {
-          playerId: myPlayerId,
-          score: newScore,
-          wordCount: updatedWords.length,
-          bestWord: bestScored.word,
-          bestWordPoints: bestScored.totalScore
-        }
-      });
-    } else if (gameMode === 'P2P_HOST') {
-      // Host updates self in leaderboard and broadcasts
-      updateHostLeaderboard(myPlayerId, newScore, updatedWords.length, bestScored.word, bestScored.totalScore);
+    // Update multiplayer score if playing Party Rush
+    if (gameModeType === 'PARTY_RUSH') {
+      const bestScored = [...updatedWords].sort((a, b) => b.totalScore - a.totalScore)[0];
+      if (p2pMode === 'GUEST') {
+        p2pManagerRef.current?.sendToHost({
+          type: 'UPDATE_SCORE',
+          payload: {
+            playerId: myPlayerId,
+            score: newScore,
+            wordCount: updatedWords.length,
+            bestWord: bestScored.word,
+            bestWordPoints: bestScored.totalScore
+          }
+        });
+      } else if (p2pMode === 'HOST') {
+        updateHostLeaderboard(myPlayerId, newScore, updatedWords.length, bestScored.word, bestScored.totalScore);
+      }
+    }
+    } finally {
+      setIsEvaluatingWord(false);
+      setTimeout(() => wordInputRef.current?.focus(), 40);
     }
   };
 
@@ -252,12 +456,16 @@ export default function App() {
     setInputFeedback({ message: msg, isError: true });
     setShakingInput(true);
     setTimeout(() => setShakingInput(false), 300);
-    setTimeout(() => setInputFeedback(null), 2500);
+    setTimeout(() => {
+      setInputFeedback(prev => (prev?.message === msg ? null : prev));
+    }, 3500);
   };
 
   const triggerInputSuccess = (msg: string) => {
     setInputFeedback({ message: msg, isError: false });
-    setTimeout(() => setInputFeedback(null), 2000);
+    setTimeout(() => {
+      setInputFeedback(prev => (prev?.message === msg ? null : prev));
+    }, 2200);
   };
 
   // ----------------------------------------------------
@@ -268,7 +476,10 @@ export default function App() {
     const code = generateRoomCode();
     setRoomCode(code);
     setP2PStatus('Creating WebRTC room...');
-    setGameMode('P2P_HOST');
+    setP2PMode('HOST');
+    setIsGuestConnected(false);
+    setGameModeType('PARTY_RUSH');
+    setActiveTab('PARTY_RUSH');
     setPlayState('LOBBY');
 
     const manager = new P2PManager(
@@ -286,7 +497,7 @@ export default function App() {
 
       const hostPlayer: Player = {
         id: manager.myPeerId,
-        name: `${playerName} (Host)`,
+        name: `${user?.displayName || playerName} (Host)`,
         avatar: playerAvatar,
         isHost: true,
         score: 0,
@@ -297,33 +508,69 @@ export default function App() {
       setPlayers([hostPlayer]);
       setLiveLeaderboard([hostPlayer]);
     } catch (err: any) {
-      triggerInputShake('Network issue. You can play Solo mode anytime with full local dictionary!');
+      triggerInputShake('Network issue. Try again or play Daily Quest!');
     }
+  };
+
+  const handleLeaveRoom = () => {
+    sounds.playClick();
+    p2pManagerRef.current?.destroy();
+    p2pManagerRef.current = null;
+    setP2PMode('IDLE');
+    setIsGuestConnected(false);
+    setP2PStatus('');
+    setPlayers([]);
+    setLiveLeaderboard([]);
   };
 
   const handleP2PHostMessage = (msg: NetworkMessage) => {
     if (msg.type === 'JOIN_REQUEST') {
       sounds.playClick();
       const guestId = msg.payload.id || msg.senderId || `guest_${Date.now()}`;
-      const newPlayer: Player = {
-        id: guestId,
-        name: msg.payload.name || `Player ${players.length + 1}`,
-        avatar: msg.payload.avatar || '🐼',
-        isHost: false,
-        score: 0,
-        wordCount: 0,
-        bestWord: '—',
-        bestWordPoints: 0
-      };
+      const guestName = msg.payload.name || `Player ${players.length + 1}`;
+      const guestAvatar = msg.payload.avatar || '🐼';
 
       setPlayers(prev => {
-        if (prev.some(p => p.id === guestId)) return prev;
-        if (prev.length >= 12) return prev; // max 12 players
-        const updated = [...prev, newPlayer];
+        const existingIdx = prev.findIndex(p => p.id === guestId);
+        let updated: Player[];
+        if (existingIdx >= 0) {
+          // Deduplicate: update existing player entry rather than duplicating
+          updated = [...prev];
+          updated[existingIdx] = {
+            ...updated[existingIdx],
+            name: guestName,
+            avatar: guestAvatar
+          };
+        } else {
+          if (prev.length >= 12) return prev;
+          const newPlayer: Player = {
+            id: guestId,
+            name: guestName,
+            avatar: guestAvatar,
+            isHost: false,
+            score: 0,
+            wordCount: 0,
+            bestWord: '—',
+            bestWordPoints: 0
+          };
+          updated = [...prev, newPlayer];
+        }
+
+        // Send explicit handshake confirmation directly back to the connecting guest
+        p2pManagerRef.current?.sendToPeer(guestId, {
+          type: 'JOIN_ACCEPTED',
+          payload: {
+            roomCode,
+            players: updated
+          }
+        });
+
+        // Broadcast updated roster to all other players in the room
         p2pManagerRef.current?.broadcast({
           type: 'PLAYER_LIST_UPDATE',
           payload: { players: updated }
         });
+
         return updated;
       });
     } else if (msg.type === 'UPDATE_SCORE') {
@@ -347,14 +594,12 @@ export default function App() {
         return p;
       });
 
-      // Sort ranking by score descending
       const ranked: LeaderboardEntry[] = [...updated]
         .sort((a, b) => b.score - a.score || b.wordCount - a.wordCount)
         .map((p, idx) => ({ ...p, rank: idx + 1 }));
 
       setLiveLeaderboard(ranked);
 
-      // Broadcast leaderboard update to all guests
       p2pManagerRef.current?.broadcast({
         type: 'LEADERBOARD_SYNC',
         payload: { ranking: ranked }
@@ -372,7 +617,10 @@ export default function App() {
     sounds.playClick();
     const code = joinCodeInput.trim().toUpperCase();
     setP2PStatus(`Connecting to room ${code}...`);
-    setGameMode('P2P_GUEST');
+    setP2PMode('GUEST');
+    setIsGuestConnected(false);
+    setGameModeType('PARTY_RUSH');
+    setActiveTab('PARTY_RUSH');
     setPlayState('LOBBY');
 
     const manager = new P2PManager(
@@ -385,7 +633,7 @@ export default function App() {
     p2pManagerRef.current = manager;
 
     try {
-      await manager.joinRoom(code, playerName, playerAvatar);
+      await manager.joinRoom(code, user?.displayName || playerName, playerAvatar);
       setMyPlayerId(manager.myPeerId);
     } catch (err: any) {
       triggerInputShake('Could not connect. Verify room code or host status.');
@@ -393,17 +641,28 @@ export default function App() {
   };
 
   const handleP2PGuestMessage = (msg: NetworkMessage) => {
-    if (msg.type === 'PLAYER_LIST_UPDATE') {
+    if (msg.type === 'JOIN_ACCEPTED') {
+      sounds.playSuccess();
+      setIsGuestConnected(true);
+      if (msg.payload.roomCode) setRoomCode(msg.payload.roomCode);
+      if (msg.payload.players) {
+        setPlayers(msg.payload.players);
+        setLiveLeaderboard(msg.payload.players);
+      }
+      setP2PStatus('Joined room! Waiting for host...');
+      triggerInputSuccess('Connected to party room!');
+    } else if (msg.type === 'PLAYER_LIST_UPDATE') {
+      setIsGuestConnected(true);
       if (msg.payload.players) {
         setPlayers(msg.payload.players);
         setLiveLeaderboard(msg.payload.players);
       }
     } else if (msg.type === 'START_GAME') {
       sounds.playSuccess();
-      setChallenges(msg.payload.challenges);
+      setActiveChallenges(msg.payload.challenges);
       setTimeLeft(msg.payload.duration || 120);
-      setMyScore(0);
-      setMyScoredWords([]);
+      setCurrentScore(0);
+      setScoredWords([]);
       setCurrentInput('');
       setPlayState('PLAYING');
       setTimeout(() => wordInputRef.current?.focus(), 150);
@@ -421,17 +680,15 @@ export default function App() {
     }
   };
 
-  // Host starts the simultaneous 120s sprint
   const handleHostStartGame = () => {
     sounds.playClick();
     const newChallenges = generateSharedChallengeBoard();
-    setChallenges(newChallenges);
-    setMyScore(0);
-    setMyScoredWords([]);
+    setActiveChallenges(newChallenges);
+    setCurrentScore(0);
+    setScoredWords([]);
     setCurrentInput('');
-    setTimeLeft(roundDuration);
+    setTimeLeft(120);
 
-    // Reset scores in player roster
     const resetPlayers = players.map(p => ({
       ...p,
       score: 0,
@@ -442,12 +699,11 @@ export default function App() {
     setPlayers(resetPlayers);
     setLiveLeaderboard(resetPlayers);
 
-    // Broadcast START_GAME to all clients
     p2pManagerRef.current?.broadcast({
       type: 'START_GAME',
       payload: {
         challenges: newChallenges,
-        duration: roundDuration
+        duration: 120
       }
     });
 
@@ -455,19 +711,16 @@ export default function App() {
     setTimeout(() => wordInputRef.current?.focus(), 150);
   };
 
-  // Inspect Word Definition
   const inspectWord = (word: string) => {
     sounds.playClick();
     const def = getWordDefinition(word);
     setShowDefinitionModal(def);
   };
 
-  // Return to Menu
-  const returnToMenu = () => {
-    sounds.playClick();
-    p2pManagerRef.current?.destroy();
-    setGameMode('MENU');
-    setPlayState('LOBBY');
+  const formatTime = (secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}:${s < 10 ? '0' : ''}${s}`;
   };
 
   const copyRoomCode = () => {
@@ -476,74 +729,149 @@ export default function App() {
     triggerInputSuccess(`Room code ${roomCode} copied!`);
   };
 
-  // Formatted Timer (e.g. "01:45")
-  const formatTime = (secs: number) => {
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    return `${m}:${s < 10 ? '0' : ''}${s}`;
-  };
-
   return (
     <div className="min-h-screen bg-[#0b101d] text-slate-100 flex flex-col justify-between selection:bg-amber-400 selection:text-slate-950 font-sans">
       
       {/* ======================================================== */}
-      {/* 1. TOP BAR */}
+      {/* 1. TOP BAR NAVIGATION */}
       {/* ======================================================== */}
-      <header className="w-full bg-[#111728]/95 backdrop-blur-md border-b border-slate-800/80 px-4 sm:px-8 py-3 flex items-center justify-between sticky top-0 z-40">
-        <button 
-          onClick={returnToMenu}
-          className="flex items-center gap-2 group cursor-pointer focus-visible:outline-none"
-        >
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-amber-500 via-orange-500 to-rose-500 flex items-center justify-center shadow-lg shadow-amber-500/20 group-hover:scale-105 transition-transform">
-            <Flame className="w-5 h-5 text-white animate-spark" />
-          </div>
-          <div className="text-left">
-            <span className="font-display font-extrabold text-lg sm:text-xl tracking-tight text-white block leading-none">
-              WordSpark
-            </span>
-            <span className="text-[10px] sm:text-xs font-semibold text-amber-400 tracking-wider uppercase">
-              Simultaneous Word Rush
-            </span>
-          </div>
-        </button>
-
-        <div className="flex items-center gap-2 sm:gap-3">
-          <button
-            onClick={() => setShowRulesModal(true)}
-            className="p-2 sm:px-3 sm:py-1.5 rounded-lg bg-slate-800/70 hover:bg-slate-700/80 text-slate-300 hover:text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
-            title="How to Play"
+      <header className="w-full bg-[#111728]/95 backdrop-blur-md border-b border-slate-800/80 px-4 sm:px-8 py-2.5 sticky top-0 z-40">
+        <div className="max-w-5xl mx-auto flex items-center justify-between gap-3">
+          
+          {/* Brand */}
+          <button 
+            onClick={() => {
+              sounds.playClick();
+              setActiveTab('HOME');
+              setPlayState('LOBBY');
+            }}
+            className="flex items-center gap-2 group cursor-pointer shrink-0 focus-visible:outline-none"
           >
-            <HelpCircle className="w-4 h-4 text-amber-400" />
-            <span className="hidden sm:inline">Rules</span>
+            <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-gradient-to-tr from-amber-500 via-orange-500 to-rose-500 flex items-center justify-center shadow-lg shadow-amber-500/20 group-hover:scale-105 transition-transform">
+              <Flame className="w-5 h-5 text-white animate-spark" />
+            </div>
+            <div className="text-left">
+              <span className="font-display font-extrabold text-base sm:text-lg tracking-tight text-white block leading-none">
+                WordSpark
+              </span>
+              <span className="text-[10px] font-semibold text-amber-400 tracking-wider uppercase">
+                Brainy English Party
+              </span>
+            </div>
           </button>
 
-          <button
-            onClick={() => setShowHighScoresModal(true)}
-            className="p-2 sm:px-3 sm:py-1.5 rounded-lg bg-slate-800/70 hover:bg-slate-700/80 text-slate-300 hover:text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
-            title="Lexicon & Scores"
-          >
-            <Trophy className="w-4 h-4 text-yellow-400" />
-            <span className="hidden sm:inline">Scores</span>
-          </button>
-
-          <button
-            onClick={handleToggleMute}
-            className="p-2 rounded-lg bg-slate-800/70 hover:bg-slate-700/80 text-slate-300 hover:text-white cursor-pointer"
-            title={isMuted ? "Unmute" : "Mute"}
-            aria-label="Sound Toggle"
-          >
-            {isMuted ? <VolumeX className="w-4 h-4 text-rose-400" /> : <Volume2 className="w-4 h-4 text-emerald-400" />}
-          </button>
-
-          {gameMode !== 'MENU' && (
+          {/* Navigation Tabs */}
+          <nav className="hidden md:flex items-center gap-1 bg-[#0b101d] p-1 rounded-xl border border-slate-800">
             <button
-              onClick={returnToMenu}
-              className="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 text-xs font-semibold flex items-center gap-1 cursor-pointer"
+              onClick={() => {
+                sounds.playClick();
+                setActiveTab('HOME');
+                setPlayState('LOBBY');
+              }}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                activeTab === 'HOME' && playState === 'LOBBY'
+                  ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/20' 
+                  : 'text-slate-400 hover:text-white'
+              }`}
             >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Menu</span>
+              <Calendar className="w-3.5 h-3.5" />
+              <span>Daily Challenge</span>
             </button>
-          )}
+
+            <button
+              onClick={() => {
+                sounds.playClick();
+                setActiveTab('PARTY_RUSH');
+                setP2PMode('IDLE');
+                setPlayState('LOBBY');
+              }}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                activeTab === 'PARTY_RUSH' 
+                  ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20' 
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <Users className="w-3.5 h-3.5" />
+              <span>Party Rush (1-12P)</span>
+            </button>
+
+            <button
+              onClick={() => {
+                sounds.playClick();
+                setSelectedRankingDate(todayDateStr);
+                setActiveTab('DAILY_RANKINGS');
+                setPlayState('LOBBY');
+              }}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                activeTab === 'DAILY_RANKINGS' 
+                  ? 'bg-orange-500 text-white shadow-md shadow-orange-500/20' 
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <Trophy className="w-3.5 h-3.5" />
+              <span>Daily Rankings</span>
+            </button>
+          </nav>
+
+          {/* User Profile & Auth Button */}
+          <div className="flex items-center gap-2 shrink-0">
+            {user ? (
+              /* Signed in State: Avatar + Name + Sign out button */
+              <div className="flex items-center gap-2 bg-[#0e1424] border border-slate-800 rounded-xl px-2.5 py-1">
+                {user.photoURL ? (
+                  <img 
+                    src={user.photoURL} 
+                    alt={user.displayName} 
+                    referrerPolicy="no-referrer"
+                    className="w-6 h-6 rounded-full border border-amber-400/60 object-cover shrink-0" 
+                  />
+                ) : (
+                  <div className="w-6 h-6 rounded-full bg-amber-500/20 text-amber-300 font-bold text-xs flex items-center justify-center shrink-0">
+                    {user.displayName.charAt(0).toUpperCase()}
+                  </div>
+                )}
+                <span className="text-xs font-bold text-white max-w-[90px] sm:max-w-[130px] truncate">
+                  {user.displayName}
+                </span>
+                <button
+                  onClick={handleSignOut}
+                  className="px-2 py-0.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 text-[11px] font-semibold flex items-center gap-1 cursor-pointer transition-colors"
+                  title="Sign out"
+                >
+                  <LogOut className="w-3 h-3" />
+                  <span className="hidden sm:inline">Sign Out</span>
+                </button>
+              </div>
+            ) : (
+              /* Not Signed In: Sign in with Google Button */
+              <button
+                onClick={handleDirectGoogleSignIn}
+                disabled={isSigningIn}
+                className="px-3 py-1.5 rounded-xl bg-white hover:bg-slate-100 disabled:opacity-60 text-slate-900 font-bold text-xs flex items-center gap-2 shadow-sm transition-all cursor-pointer active:scale-95"
+              >
+                {isSigningIn ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-slate-700" />
+                ) : (
+                  <svg className="w-3.5 h-3.5" viewBox="0 0 24 24">
+                    <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"/>
+                    <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.33 24 12 24z"/>
+                    <path fill="#FBBC05" d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.18 0 10.04 0 12s.45 3.82 1.25 5.42l4.03-3.15z"/>
+                    <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"/>
+                  </svg>
+                )}
+                <span>Sign in with Google</span>
+              </button>
+            )}
+
+            <button
+              onClick={handleToggleMute}
+              className="p-2 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors cursor-pointer"
+              title={isMuted ? "Unmute Sound" : "Mute Sound"}
+            >
+              {isMuted ? <VolumeX className="w-4 h-4 text-rose-400" /> : <Volume2 className="w-4 h-4 text-emerald-400" />}
+            </button>
+          </div>
+
         </div>
       </header>
 
@@ -560,15 +888,16 @@ export default function App() {
       )}
 
       {/* ======================================================== */}
-      {/* 2. MAIN CONTAINER */}
+      {/* 2. MAIN APPLICATION WORKSPACE */}
       {/* ======================================================== */}
       <main className="flex-1 w-full max-w-4xl mx-auto px-4 py-4 sm:py-6 flex flex-col justify-center">
 
         {/* ---------------------------------------------------- */}
-        {/* A. TITLE & MODE SELECT */}
+        {/* VIEW 1: HOME SCREEN (FEATURE CARDS) */}
         {/* ---------------------------------------------------- */}
-        {gameMode === 'MENU' && (
+        {activeTab === 'HOME' && playState === 'LOBBY' && (
           <div className="flex flex-col items-center justify-center text-center space-y-6 sm:space-y-8 my-auto">
+            {/* Hero Lockup */}
             <div className="relative">
               <div className="w-20 h-20 sm:w-24 sm:h-24 mx-auto rounded-3xl bg-gradient-to-tr from-amber-500 via-orange-500 to-rose-600 flex items-center justify-center shadow-2xl shadow-orange-500/30 mb-3 animate-bomb-pulse">
                 <Flame className="w-12 h-12 text-white animate-spark" />
@@ -576,244 +905,201 @@ export default function App() {
               <h1 className="text-3xl sm:text-5xl font-extrabold font-display tracking-tight text-white">
                 Word<span className="text-transparent bg-clip-text bg-gradient-to-r from-amber-400 via-orange-400 to-rose-400">Spark</span>
               </h1>
-              <p className="text-slate-400 text-sm sm:text-base max-w-md mx-auto mt-2">
-                Simultaneous Vocabulary Sprint for 1 to 12 players. All players race against the 120s clock together with zero waiting!
+              <p className="text-slate-400 text-xs sm:text-sm max-w-md mx-auto mt-2">
+                Brainy English Party: Daily Google-authenticated quest, live Firestore rankings, and 12-player simultaneous rush!
               </p>
-            </div>
 
-            {/* Quick Profile Setup */}
-            <div className="bg-[#141c30] border border-slate-800 rounded-2xl p-4 w-full max-w-md text-left flex items-center gap-3">
-              <button
-                type="button"
-                onClick={() => {
-                  sounds.playClick();
-                  const cur = AVATAR_OPTIONS.indexOf(playerAvatar);
-                  setPlayerAvatar(AVATAR_OPTIONS[(cur + 1) % AVATAR_OPTIONS.length]);
-                }}
-                className="w-11 h-11 rounded-xl bg-slate-800 hover:bg-slate-700 flex items-center justify-center text-2xl shrink-0 cursor-pointer shadow-inner"
-                title="Tap to change avatar"
-              >
-                {playerAvatar}
-              </button>
-              <div className="flex-1">
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Your Nickname</label>
-                <input
-                  type="text"
-                  maxLength={14}
-                  value={playerName}
-                  onChange={e => setPlayerName(e.target.value)}
-                  placeholder="Enter name"
-                  className="w-full bg-transparent border-none text-white font-bold text-sm focus:outline-none"
-                />
+              {/* Midnight countdown teaser pill */}
+              <div className="mt-3 inline-flex items-center gap-2 bg-[#141c30] border border-amber-500/30 px-3.5 py-1 rounded-full text-xs font-semibold text-amber-300">
+                <Clock className="w-3.5 h-3.5 text-amber-400" />
+                <span>Today: {todayDateStr} · Daily Reset in {timeUntilReset}</span>
               </div>
             </div>
 
-            {/* Mode Cards */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 w-full max-w-2xl">
-              {/* Solo 120s Sprint */}
-              <div className="bg-[#141c30] border border-slate-800 hover:border-amber-500/60 rounded-3xl p-6 text-left flex flex-col justify-between group transition-all duration-200 hover:-translate-y-1 shadow-xl">
+            {/* MAIN 3 GAME MODE CARDS */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 w-full max-w-3xl text-left">
+              
+              {/* CARD 1: DAILY CHALLENGE (Replaced Solo Sprint) */}
+              <div className="bg-[#141c30] border border-amber-500/40 hover:border-amber-400 rounded-3xl p-5 flex flex-col justify-between group transition-all duration-200 hover:-translate-y-1 shadow-xl hover:shadow-amber-500/10 relative overflow-hidden">
+                <div className="absolute top-0 right-0 bg-amber-500 text-slate-950 font-black text-[9px] uppercase px-2.5 py-0.5 rounded-bl-xl tracking-wider">
+                  Official Quest
+                </div>
+
                 <div>
                   <div className="w-10 h-10 rounded-xl bg-amber-500/20 border border-amber-500/30 flex items-center justify-center mb-3 text-amber-400 group-hover:scale-110 transition-transform">
-                    <User className="w-5 h-5" />
+                    <Calendar className="w-5 h-5" />
                   </div>
-                  <h3 className="font-display font-bold text-xl text-white">Solo 120s Sprint</h3>
-                  <p className="text-slate-400 text-xs sm:text-sm mt-1.5 leading-relaxed">
-                    Jump straight into a 2-minute sprint. Solve shared board prompts, score big vocabulary, and beat your personal record.
+                  <h3 className="font-display font-extrabold text-lg text-white">Daily Challenge</h3>
+                  <p className="text-slate-400 text-xs mt-1 leading-relaxed">
+                    Same 4 prompts globally each date. 120-sec sprint with 1 official ranked score per day logged to Firestore!
                   </p>
+
+                  {/* Seeded Board Mini Indicators */}
+                  <div className="mt-3 bg-[#0d1322] p-2.5 rounded-xl border border-slate-800 space-y-1 text-[11px]">
+                    <div className="text-slate-300 flex justify-between">
+                      <span className="text-slate-500">Topic:</span>
+                      <span className="text-emerald-400 font-bold">{dailyBoardData.targetCategory}</span>
+                    </div>
+                    <div className="text-slate-300 flex justify-between">
+                      <span className="text-slate-500">Bonus Letter:</span>
+                      <span className="text-amber-400 font-bold">"{dailyBoardData.bonusLetter}" (+20 pts)</span>
+                    </div>
+                  </div>
                 </div>
-                <button
-                  onClick={startSoloSprint}
-                  className="mt-6 w-full py-3 px-4 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-display font-extrabold text-sm uppercase tracking-wider flex items-center justify-center gap-2 shadow-lg shadow-orange-500/20 cursor-pointer active:translate-y-0.5"
-                >
-                  <Play className="w-4 h-4 fill-current" /> Start Solo Sprint
-                </button>
+
+                <div className="mt-4">
+                  {hasCompletedToday ? (
+                    <div className="text-[11px] text-emerald-400 font-bold mb-1.5 flex items-center gap-1">
+                      <ShieldCheck className="w-3.5 h-3.5" />
+                      <span>Today's Score: {previousDailyScore || 0} pts</span>
+                    </div>
+                  ) : !user ? (
+                    <div className="text-[10px] text-amber-300/80 font-medium mb-1.5 flex items-center gap-1">
+                      <LogIn className="w-3 h-3 text-amber-400" />
+                      <span>Sign in required to record rank</span>
+                    </div>
+                  ) : null}
+
+                  <button
+                    onClick={handleStartDailyChallenge}
+                    className="w-full py-2.5 px-3 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-display font-extrabold text-xs uppercase tracking-wider flex items-center justify-center gap-1.5 shadow-md shadow-orange-500/20 cursor-pointer active:translate-y-0.5"
+                  >
+                    <Play className="w-3.5 h-3.5 fill-current" />
+                    <span>{hasCompletedToday ? 'Practice Today\'s Quest' : 'Play Daily Challenge'}</span>
+                  </button>
+                </div>
               </div>
 
-              {/* Multiplayer Room (1–12 Players) */}
-              <div className="bg-[#141c30] border border-slate-800 hover:border-cyan-500/60 rounded-3xl p-6 text-left flex flex-col justify-between group transition-all duration-200 hover:-translate-y-1 shadow-xl">
+              {/* CARD 2: PARTY RUSH (Multiplayer 1-12 Players) */}
+              <div className="bg-[#141c30] border border-slate-800 hover:border-cyan-500/60 rounded-3xl p-5 flex flex-col justify-between group transition-all duration-200 hover:-translate-y-1 shadow-xl hover:shadow-cyan-500/10">
                 <div>
                   <div className="w-10 h-10 rounded-xl bg-cyan-500/20 border border-cyan-500/30 flex items-center justify-center mb-3 text-cyan-400 group-hover:scale-110 transition-transform">
                     <Users className="w-5 h-5" />
                   </div>
-                  <h3 className="font-display font-bold text-xl text-white">Multiplayer Word Rush</h3>
-                  <p className="text-slate-400 text-xs sm:text-sm mt-1.5 leading-relaxed">
-                    1 to 12 players simultaneous clash! Connect via 4-letter room code. Zero lag, live leaderboard sync every second.
+                  <h3 className="font-display font-extrabold text-lg text-white">Party Word Rush</h3>
+                  <p className="text-slate-400 text-xs mt-1 leading-relaxed">
+                    1 to 12 players simultaneous clash! Connect via 4-letter room code. Zero wait time, live leaderboard every second.
                   </p>
+
+                  <div className="mt-3 bg-[#0d1322] p-2.5 rounded-xl border border-slate-800 text-[11px] text-slate-400 space-y-1">
+                    <div>• 120s Shared Bomb Timer</div>
+                    <div>• Instant Local Scoring</div>
+                    <div>• Real-time Synced Roster</div>
+                  </div>
                 </div>
-                <div className="mt-6 flex gap-2">
+
+                <div className="mt-4 flex gap-2">
                   <button
                     onClick={handleHostCreateRoom}
-                    className="flex-1 py-3 px-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-display font-extrabold text-xs uppercase tracking-wider text-center cursor-pointer active:translate-y-0.5 shadow-md shadow-cyan-500/20"
+                    className="flex-1 py-2.5 px-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs uppercase tracking-wider text-center cursor-pointer active:translate-y-0.5 shadow-md shadow-cyan-500/20"
                   >
                     Host Room
                   </button>
                   <button
                     onClick={() => {
-                      setGameMode('P2P_GUEST');
-                      setPlayState('LOBBY');
+                      setActiveTab('PARTY_RUSH');
+                      setP2PMode('GUEST');
                     }}
-                    className="flex-1 py-3 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-cyan-300 font-display font-extrabold text-xs uppercase tracking-wider text-center cursor-pointer active:translate-y-0.5"
+                    className="flex-1 py-2.5 px-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold text-xs uppercase tracking-wider text-center cursor-pointer active:translate-y-0.5"
                   >
-                    Join Room
+                    Join
                   </button>
                 </div>
               </div>
-            </div>
 
-            {/* Quick Scoring Banner */}
-            <div className="flex flex-wrap items-center justify-center gap-3 text-xs text-slate-400">
-              <span className="text-amber-400 font-semibold">3-4 letters: 10 pts</span>
-              <span>·</span>
-              <span className="text-orange-400 font-semibold">5-6 letters: 25 pts</span>
-              <span>·</span>
-              <span className="text-rose-400 font-semibold">7+ letters: 50 pts</span>
-              <span>·</span>
-              <span className="text-emerald-400 font-semibold">Match Bonus: +20 pts</span>
-            </div>
-          </div>
-        )}
-
-        {/* ---------------------------------------------------- */}
-        {/* B. MULTIPLAYER HOST LOBBY */}
-        {/* ---------------------------------------------------- */}
-        {gameMode === 'P2P_HOST' && playState === 'LOBBY' && (
-          <div className="bg-[#141c30] border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-lg mx-auto space-y-6 shadow-2xl">
-            <div className="text-center">
-              <span className="text-xs font-bold text-cyan-400 uppercase tracking-wider">Multiplayer Host</span>
-              <h2 className="text-2xl sm:text-3xl font-display font-extrabold text-white mt-1">Word Rush Room</h2>
-              <p className="text-slate-400 text-xs sm:text-sm mt-1">
-                Tell friends to enter this 4-letter room code on their phone or laptop:
-              </p>
-            </div>
-
-            <div className="bg-[#0b101d] border-2 border-cyan-500/40 rounded-2xl p-4 text-center">
-              <span className="text-[10px] text-cyan-400 uppercase font-bold tracking-widest block mb-1">Room Code</span>
-              <span className="text-4xl font-display font-black tracking-widest text-white selection:bg-cyan-500">
-                {roomCode}
-              </span>
-              <button
-                onClick={copyRoomCode}
-                className="mt-3 px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 text-xs font-semibold flex items-center gap-1.5 mx-auto cursor-pointer"
-              >
-                <Copy className="w-3.5 h-3.5" /> Copy Code
-              </button>
-            </div>
-
-            <div>
-              <div className="flex items-center justify-between text-xs text-slate-400 font-semibold mb-2 px-1">
-                <span>Roster ({players.length}/12 Players)</span>
-                <span>{p2pStatus}</span>
-              </div>
-              <div className="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto">
-                {players.map(p => (
-                  <div key={p.id} className="bg-[#0e1424] p-2.5 rounded-xl border border-slate-800 flex items-center gap-2">
-                    <span className="text-xl">{p.avatar}</span>
-                    <span className="text-xs font-bold text-white truncate">{p.name}</span>
+              {/* CARD 3: DAILY RANKINGS (Global Firestore Leaderboard) */}
+              <div className="bg-[#141c30] border border-slate-800 hover:border-orange-500/60 rounded-3xl p-5 flex flex-col justify-between group transition-all duration-200 hover:-translate-y-1 shadow-xl hover:shadow-orange-500/10">
+                <div>
+                  <div className="w-10 h-10 rounded-xl bg-orange-500/20 border border-orange-500/30 flex items-center justify-center mb-3 text-orange-400 group-hover:scale-110 transition-transform">
+                    <Trophy className="w-5 h-5" />
                   </div>
-                ))}
-              </div>
-            </div>
+                  <h3 className="font-display font-extrabold text-lg text-white">Daily Rankings</h3>
+                  <p className="text-slate-400 text-xs mt-1 leading-relaxed">
+                    Live cloud leaderboard powered by Firestore. View Top 50 global champions for {todayDateStr}.
+                  </p>
 
-            <button
-              onClick={handleHostStartGame}
-              className="w-full py-4 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-display font-extrabold text-sm uppercase tracking-wider flex items-center justify-center gap-2 shadow-xl shadow-cyan-500/20 cursor-pointer active:translate-y-0.5"
-            >
-              <Play className="w-4 h-4 fill-current" /> Start 120s Simultaneous Sprint!
-            </button>
-          </div>
-        )}
+                  {/* Leaderboard preview snapshot */}
+                  <div className="mt-3 bg-[#0d1322] p-2.5 rounded-xl border border-slate-800 space-y-1.5 text-[11px]">
+                    {dailyLeaderboard.slice(0, 2).map((entry, idx) => (
+                      <div key={entry.uid} className="flex items-center justify-between">
+                        <span className="text-slate-300 font-semibold truncate max-w-[100px]">
+                          {idx === 0 ? '🥇' : '🥈'} {entry.displayName}
+                        </span>
+                        <span className="font-display font-bold text-amber-400">{entry.score} pts</span>
+                      </div>
+                    ))}
+                    {dailyLeaderboard.length === 0 && (
+                      <div className="text-slate-500 text-[10px] italic">Be the first to score today!</div>
+                    )}
+                  </div>
+                </div>
 
-        {/* ---------------------------------------------------- */}
-        {/* C. MULTIPLAYER GUEST LOBBY */}
-        {/* ---------------------------------------------------- */}
-        {gameMode === 'P2P_GUEST' && playState === 'LOBBY' && (
-          <div className="bg-[#141c30] border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-md mx-auto space-y-6 shadow-2xl">
-            <div className="text-center">
-              <span className="text-xs font-bold text-cyan-400 uppercase tracking-wider">Join Room</span>
-              <h2 className="text-2xl sm:text-3xl font-display font-extrabold text-white mt-1">Enter Room Code</h2>
-            </div>
-
-            <div className="space-y-4">
-              <div>
-                <label className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">
-                  4-Letter Room Code
-                </label>
-                <input
-                  type="text"
-                  maxLength={4}
-                  value={joinCodeInput}
-                  onChange={e => setJoinCodeInput(e.target.value.toUpperCase())}
-                  placeholder="e.g. RUSH"
-                  className="w-full text-center text-3xl font-display font-black tracking-widest bg-[#0b101d] border-2 border-slate-700 focus:border-cyan-400 rounded-2xl p-3 text-white uppercase outline-none"
-                />
-              </div>
-
-              <div>
-                <label className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">
-                  Your Nickname
-                </label>
-                <input
-                  type="text"
-                  maxLength={14}
-                  value={playerName}
-                  onChange={e => setPlayerName(e.target.value)}
-                  className="w-full bg-[#0b101d] border border-slate-700 focus:border-cyan-400 rounded-xl p-3 text-white text-sm font-semibold outline-none"
-                />
-              </div>
-
-              <div>
-                <label className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">
-                  Choose Avatar
-                </label>
-                <div className="flex flex-wrap gap-2 justify-center">
-                  {AVATAR_OPTIONS.map(av => (
-                    <button
-                      key={av}
-                      type="button"
-                      onClick={() => setPlayerAvatar(av)}
-                      className={`w-9 h-9 rounded-xl text-lg flex items-center justify-center cursor-pointer transition-transform ${playerAvatar === av ? 'bg-cyan-500 scale-110 shadow-md shadow-cyan-500/30' : 'bg-slate-800 hover:bg-slate-700'}`}
-                    >
-                      {av}
-                    </button>
-                  ))}
+                <div className="mt-4">
+                  <button
+                    onClick={() => {
+                      sounds.playClick();
+                      setSelectedRankingDate(todayDateStr);
+                      setActiveTab('DAILY_RANKINGS');
+                    }}
+                    className="w-full py-2.5 px-3 rounded-xl bg-orange-500 hover:bg-orange-400 text-white font-display font-extrabold text-xs uppercase tracking-wider flex items-center justify-center gap-1.5 shadow-md shadow-orange-500/20 cursor-pointer active:translate-y-0.5"
+                  >
+                    <Trophy className="w-3.5 h-3.5" />
+                    <span>View Rankings</span>
+                  </button>
                 </div>
               </div>
+
             </div>
 
-            <button
-              onClick={handleGuestJoinRoom}
-              className="w-full py-3.5 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-display font-extrabold text-sm uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer shadow-lg shadow-cyan-500/20 active:translate-y-0.5"
-            >
-              <Radio className="w-4 h-4" /> Connect & Wait for Start
-            </button>
+            {/* SPONSOR BANNER */}
+            <div className="pt-2">
+              <AdBanner />
+            </div>
 
-            {p2pStatus && (
-              <p className="text-center text-xs text-cyan-300 font-semibold animate-pulse">{p2pStatus}</p>
-            )}
+            {/* Quick Lexicon Search & Rules bar */}
+            <div className="flex flex-wrap items-center justify-center gap-3 text-xs text-slate-400 pt-2">
+              <button
+                onClick={() => setShowRulesModal(true)}
+                className="hover:text-amber-300 flex items-center gap-1 cursor-pointer"
+              >
+                <HelpCircle className="w-3.5 h-3.5 text-amber-400" />
+                <span>How to Play</span>
+              </button>
+              <span>·</span>
+              <span className="flex items-center gap-1 text-emerald-400">
+                <BookOpen className="w-3.5 h-3.5" />
+                <span>3,500+ Verified English Nouns</span>
+              </span>
+              <span>·</span>
+              <span className="text-amber-400 font-medium">
+                Nouns Only · 3-4 letters: 10p · 5-6: 25p · 7+: 50p
+              </span>
+            </div>
           </div>
         )}
 
         {/* ---------------------------------------------------- */}
-        {/* D. ACTIVE 120s SIMULTANEOUS PLAYFIELD */}
+        {/* VIEW 2: ACTIVE PLAYFIELD (DAILY QUEST & MULTIPLAYER) */}
         {/* ---------------------------------------------------- */}
         {playState === 'PLAYING' && (
           <div className="space-y-4 sm:space-y-5">
-            
-            {/* Header Status Strip: Shared Timer & Local Score */}
+            {/* Header Status Strip */}
             <div className="bg-[#141c30] border border-slate-800 rounded-2xl p-4 flex items-center justify-between shadow-xl">
               <div>
-                <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">Your Score</span>
+                <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">
+                  {gameModeType === 'DAILY_QUEST' ? (isOfficialAttempt ? '★ Official Daily Run' : 'Practice Run') : 'Your Score'}
+                </span>
                 <div className="flex items-baseline gap-1.5">
                   <span className="text-3xl sm:text-4xl font-display font-black text-amber-400 tabular-nums">
-                    {myScore}
+                    {currentScore}
                   </span>
                   <span className="text-xs font-bold text-slate-400">pts</span>
                 </div>
               </div>
 
-              {/* Real-time 120s Countdown Timer */}
+              {/* 120s Countdown Timer */}
               <div className="text-center">
-                <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">Round Timer</span>
+                <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">Timer</span>
                 <div className={`flex items-center justify-center gap-1 font-display text-3xl sm:text-4xl font-black tabular-nums ${
                   timeLeft <= 10 ? 'text-rose-500 animate-pulse' : timeLeft <= 30 ? 'text-orange-400' : 'text-emerald-400'
                 }`}>
@@ -822,17 +1108,17 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Words Count & Best Word */}
+              {/* Words Count */}
               <div className="text-right">
-                <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">Words Scored</span>
+                <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">Words</span>
                 <span className="text-2xl sm:text-3xl font-display font-bold text-cyan-400 tabular-nums">
-                  {myScoredWords.length}
+                  {scoredWords.length}
                 </span>
               </div>
             </div>
 
-            {/* LIVE LEADERBOARD MINI SCOREBOARD (Visible in Multiplayer) */}
-            {(gameMode === 'P2P_HOST' || gameMode === 'P2P_GUEST') && liveLeaderboard.length > 0 && (
+            {/* Multiplayer Live Scoreboard Mini Strip (If in Party Rush) */}
+            {gameModeType === 'PARTY_RUSH' && liveLeaderboard.length > 0 && (
               <div className="bg-[#0e1526] border border-cyan-500/30 rounded-2xl p-3 shadow-lg">
                 <div className="flex items-center justify-between text-[11px] font-bold text-cyan-400 uppercase tracking-wider mb-2 px-1">
                   <span className="flex items-center gap-1.5">
@@ -840,47 +1126,41 @@ export default function App() {
                   </span>
                   <span className="text-slate-400 font-normal">Syncing every word</span>
                 </div>
-                
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {liveLeaderboard.slice(0, 4).map((entry, idx) => {
-                    const isMe = entry.id === myPlayerId;
-                    return (
-                      <div 
-                        key={entry.id}
-                        className={`flex items-center justify-between p-2 rounded-xl text-xs ${
-                          isMe 
-                            ? 'bg-cyan-500/20 border border-cyan-500/50 text-white font-bold' 
-                            : 'bg-[#141c30] border border-slate-800 text-slate-300'
-                        }`}
-                      >
-                        <div className="flex items-center gap-1.5 truncate">
-                          <span className={`w-4 text-center font-bold ${idx === 0 ? 'text-yellow-400' : idx === 1 ? 'text-slate-300' : 'text-amber-600'}`}>
-                            #{idx + 1}
-                          </span>
-                          <span>{entry.avatar}</span>
-                          <span className="truncate max-w-[70px]">{entry.name}</span>
-                        </div>
-                        <span className="font-display font-extrabold text-amber-400 tabular-nums ml-1">
-                          {entry.score}
-                        </span>
+                  {liveLeaderboard.slice(0, 4).map((entry, idx) => (
+                    <div 
+                      key={entry.id}
+                      className={`flex items-center justify-between p-2 rounded-xl text-xs ${
+                        entry.id === myPlayerId ? 'bg-cyan-500/20 border border-cyan-500/50 text-white font-bold' : 'bg-[#141c30] border border-slate-800 text-slate-300'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 truncate">
+                        <span className="w-4 text-center font-bold text-amber-400">#{idx + 1}</span>
+                        <span>{entry.avatar}</span>
+                        <span className="truncate max-w-[70px]">{entry.name}</span>
                       </div>
-                    );
-                  })}
+                      <span className="font-display font-bold text-amber-400 tabular-nums">
+                        {entry.score}
+                      </span>
+                    </div>
+                  ))}
                 </div>
               </div>
             )}
 
-            {/* DYNAMIC SHARED CHALLENGE BOARD */}
+            {/* SHARED CHALLENGE BOARD */}
             <div className="bg-[#101726] border border-slate-800/90 rounded-2xl p-4">
               <div className="flex items-center justify-between mb-2.5">
                 <span className="text-xs font-bold text-amber-400 uppercase tracking-wider flex items-center gap-1.5">
-                  <Sparkles className="w-4 h-4" /> Shared Challenge Board (+20 Bonus Pts Each)
+                  <Sparkles className="w-4 h-4" /> Board Prompts (+20 Bonus Pts Each)
                 </span>
-                <span className="text-[10px] text-slate-400">Everyone shares this board</span>
+                <span className="text-[10px] text-slate-400">
+                  {gameModeType === 'DAILY_QUEST' ? `Daily Quest · ${todayDateStr}` : 'Party Board'}
+                </span>
               </div>
 
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
-                {challenges.map(c => (
+                {activeChallenges.map(c => (
                   <div 
                     key={c.id} 
                     className="bg-[#151f36] border border-slate-700/80 rounded-xl p-2.5 flex flex-col justify-between"
@@ -904,47 +1184,59 @@ export default function App() {
               </div>
             </div>
 
-            {/* WORD INPUT FIELD & SUBMIT */}
-            <form onSubmit={handleWordSubmit} className="flex gap-2">
-              <input
-                ref={wordInputRef}
-                type="text"
-                value={currentInput}
-                onChange={e => setCurrentInput(e.target.value.toUpperCase())}
-                placeholder="Type words fast and press Enter..."
-                autoCapitalize="characters"
-                autoComplete="off"
-                spellCheck="false"
-                className={`flex-1 bg-[#141c30] border-2 ${
-                  shakingInput ? 'border-rose-500 animate-shake' : 'border-slate-700 focus:border-amber-400'
-                } text-white text-lg sm:text-xl font-bold px-4 py-3 rounded-2xl outline-none transition-colors tracking-widest placeholder:text-slate-600 placeholder:tracking-normal placeholder:font-normal placeholder:text-sm`}
-              />
-              <button
-                type="submit"
-                className="bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-display font-extrabold text-sm sm:text-base px-6 py-3 rounded-2xl cursor-pointer shadow-lg shadow-orange-500/20 active:translate-y-0.5"
-              >
-                Score!
-              </button>
-            </form>
+            {/* WORD INPUT & SUBMIT */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between px-1">
+                <span className="text-[11px] font-bold text-amber-400 flex items-center gap-1.5">
+                  <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Rule: English NOUNS only!</span>
+                </span>
+                <span className="text-[10px] text-slate-400">Verbs & Adjectives rejected</span>
+              </div>
+              <form onSubmit={handleWordSubmit} className="flex gap-2">
+                <input
+                  ref={wordInputRef}
+                  type="text"
+                  value={currentInput}
+                  onChange={e => setCurrentInput(e.target.value.toUpperCase())}
+                  placeholder="Type an English NOUN and press Enter..."
+                  autoCapitalize="characters"
+                  autoComplete="off"
+                  spellCheck="false"
+                  disabled={isEvaluatingWord}
+                  className={`flex-1 bg-[#141c30] border-2 ${
+                    shakingInput ? 'border-rose-500 animate-shake shadow-lg shadow-rose-950/60 ring-2 ring-rose-500/50' : 'border-slate-700 focus:border-amber-400'
+                  } text-white text-base sm:text-xl font-bold px-4 py-3 rounded-2xl outline-none transition-colors tracking-widest placeholder:text-slate-500 placeholder:tracking-normal placeholder:font-normal placeholder:text-xs sm:placeholder:text-sm`}
+                />
+                <button
+                  type="submit"
+                  disabled={isEvaluatingWord}
+                  className="bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 disabled:opacity-60 text-slate-950 font-display font-extrabold text-sm sm:text-base px-6 py-3 rounded-2xl cursor-pointer shadow-lg shadow-orange-500/20 active:translate-y-0.5 flex items-center gap-1.5 shrink-0"
+                >
+                  {isEvaluatingWord && <RefreshCw className="w-4 h-4 animate-spin text-slate-950" />}
+                  <span>{isEvaluatingWord ? 'Checking...' : 'Score!'}</span>
+                </button>
+              </form>
+            </div>
 
-            {/* MY RECENT WORD STACK */}
+            {/* SCORED WORDS LIST */}
             <div className="bg-[#101726] border border-slate-800/80 rounded-2xl p-4">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                  Your Scored Words ({myScoredWords.length}) · Click any to view definition
+                  Scored Words ({scoredWords.length}) · Tap to view definition
                 </span>
                 <span className="text-xs text-amber-400 font-medium">
                   Best: {myBestWord.word} ({myBestWord.totalScore} pts)
                 </span>
               </div>
 
-              {myScoredWords.length === 0 ? (
+              {scoredWords.length === 0 ? (
                 <div className="py-6 text-center text-slate-500 text-xs italic">
                   No words scored yet. Type any valid 3+ letter English word matching the board!
                 </div>
               ) : (
                 <div className="flex flex-wrap gap-2 max-h-36 overflow-y-auto p-1">
-                  {myScoredWords.map((item, idx) => (
+                  {scoredWords.map((item, idx) => (
                     <button
                       key={`${item.word}-${idx}`}
                       onClick={() => inspectWord(item.word)}
@@ -954,7 +1246,7 @@ export default function App() {
                       <span className="text-[10px] text-amber-400 tabular-nums">+{item.totalScore}</span>
                       {item.matchedChallengeTitles.length > 0 && (
                         <span className="text-[9px] bg-emerald-500/20 text-emerald-300 px-1 rounded">
-                          ★ match
+                          ★ bonus
                         </span>
                       )}
                     </button>
@@ -962,116 +1254,58 @@ export default function App() {
                 </div>
               )}
             </div>
-
           </div>
         )}
 
         {/* ---------------------------------------------------- */}
-        {/* E. GAME OVER & PODIUM SCREEN */}
+        {/* VIEW 3: GAME OVER & SUMMARY */}
         {/* ---------------------------------------------------- */}
         {playState === 'GAME_OVER' && (
           <div className="bg-[#141c30] border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-xl mx-auto space-y-6 shadow-2xl">
             <div className="text-center">
               <span className="text-xs font-bold text-amber-400 uppercase tracking-wider">120s Round Complete</span>
-              <h2 className="text-3xl font-display font-black text-white mt-1">Vocabulary Sprint Podium</h2>
+              <h2 className="text-3xl font-display font-black text-white mt-1">
+                {gameModeType === 'DAILY_QUEST' ? 'Daily Quest Complete!' : 'Vocabulary Sprint Podium'}
+              </h2>
             </div>
 
-            {/* MULTIPLAYER PODIUM (If 2+ players) */}
-            {liveLeaderboard.length >= 2 ? (
-              <div className="grid grid-cols-3 gap-2 items-end pt-4 pb-2 text-center">
-                {/* 2nd Place */}
-                <div className="bg-[#0e1424] p-3 rounded-2xl border border-slate-800 flex flex-col items-center">
-                  <span className="text-2xl mb-1">{liveLeaderboard[1]?.avatar || '🥈'}</span>
-                  <span className="text-xs font-bold text-slate-300 truncate max-w-full">
-                    {liveLeaderboard[1]?.name || 'Player 2'}
-                  </span>
-                  <span className="text-lg font-display font-black text-slate-200 mt-1">
-                    {liveLeaderboard[1]?.score || 0} pts
-                  </span>
-                  <span className="text-[10px] text-slate-500 font-bold uppercase mt-1">2nd Place</span>
-                </div>
-
-                {/* 1st Place Champion */}
-                <div className="bg-gradient-to-b from-amber-500/20 to-orange-500/10 p-4 rounded-2xl border-2 border-amber-500 shadow-xl flex flex-col items-center -translate-y-2">
-                  <span className="text-3xl mb-1">{liveLeaderboard[0]?.avatar || '👑'}</span>
-                  <span className="text-sm font-bold text-white truncate max-w-full">
-                    {liveLeaderboard[0]?.name || 'Champion'}
-                  </span>
-                  <span className="text-2xl font-display font-black text-amber-400 mt-1">
-                    {liveLeaderboard[0]?.score || 0} pts
-                  </span>
-                  <span className="text-[10px] bg-amber-500 text-slate-950 px-2 py-0.5 rounded-full font-black uppercase mt-1">
-                    1st Winner
-                  </span>
-                </div>
-
-                {/* 3rd Place */}
-                <div className="bg-[#0e1424] p-3 rounded-2xl border border-slate-800 flex flex-col items-center">
-                  <span className="text-2xl mb-1">{liveLeaderboard[2]?.avatar || '🥉'}</span>
-                  <span className="text-xs font-bold text-slate-300 truncate max-w-full">
-                    {liveLeaderboard[2]?.name || 'Player 3'}
-                  </span>
-                  <span className="text-lg font-display font-black text-amber-600 mt-1">
-                    {liveLeaderboard[2]?.score || 0} pts
-                  </span>
-                  <span className="text-[10px] text-slate-500 font-bold uppercase mt-1">3rd Place</span>
-                </div>
+            {/* Score Summary Box */}
+            <div className="grid grid-cols-3 gap-3 bg-[#0d1322] p-4 rounded-2xl border border-slate-800 text-center">
+              <div>
+                <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider block">Final Score</span>
+                <span className="text-2xl font-display font-extrabold text-amber-400 tabular-nums">{currentScore} pts</span>
               </div>
-            ) : (
-              /* Solo Summary Stats */
-              <div className="grid grid-cols-3 gap-3 bg-[#0d1322] p-4 rounded-2xl border border-slate-800 text-center">
-                <div>
-                  <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider block">Final Score</span>
-                  <span className="text-2xl font-display font-extrabold text-amber-400 tabular-nums">{myScore} pts</span>
-                </div>
-                <div>
-                  <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider block">Total Words</span>
-                  <span className="text-2xl font-display font-extrabold text-cyan-400 tabular-nums">{myScoredWords.length}</span>
-                </div>
-                <div>
-                  <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider block">Best Word</span>
-                  <span className="text-lg font-display font-bold text-emerald-400 truncate block">{myBestWord.word}</span>
-                </div>
+              <div>
+                <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider block">Words Found</span>
+                <span className="text-2xl font-display font-extrabold text-cyan-400 tabular-nums">{scoredWords.length}</span>
               </div>
-            )}
+              <div>
+                <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider block">Best Word</span>
+                <span className="text-lg font-display font-bold text-emerald-400 truncate block">{myBestWord.word}</span>
+              </div>
+            </div>
 
-            {/* Detailed Player Breakdown Table */}
-            {liveLeaderboard.length > 0 && (
-              <div className="bg-[#0d1322] rounded-2xl border border-slate-800 p-3 space-y-1.5 max-h-48 overflow-y-auto">
-                <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block px-1">
-                  Full Ranking & Highest-Scoring Words
+            {/* Daily Quest Cloud Confirmation */}
+            {gameModeType === 'DAILY_QUEST' && (
+              <div className="bg-emerald-950/40 border border-emerald-500/40 p-4 rounded-2xl text-center">
+                <CheckCircle2 className="w-6 h-6 text-emerald-400 mx-auto mb-1" />
+                <span className="font-bold text-emerald-300 text-sm block">
+                  {isOfficialAttempt ? 'Official Daily Score Submitted to Firestore!' : 'Practice Run Completed!'}
                 </span>
-                {liveLeaderboard.map((entry, idx) => (
-                  <div key={entry.id} className="flex items-center justify-between p-2 rounded-xl text-xs bg-[#141c30]">
-                    <div className="flex items-center gap-2 truncate">
-                      <span className="w-5 text-center font-bold text-amber-400">#{idx + 1}</span>
-                      <span>{entry.avatar}</span>
-                      <span className="font-bold text-white truncate max-w-[100px]">{entry.name}</span>
-                    </div>
-                    <div className="text-right flex items-center gap-3">
-                      <span className="text-slate-400 text-[11px]">
-                        Best: <span className="text-emerald-400 font-semibold">{entry.bestWord || '—'}</span>
-                      </span>
-                      <span className="text-slate-400 text-[11px]">
-                        {entry.wordCount} words
-                      </span>
-                      <span className="font-display font-extrabold text-amber-400 tabular-nums">
-                        {entry.score} pts
-                      </span>
-                    </div>
-                  </div>
-                ))}
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Check your position on the Global Daily Leaderboard for {todayDateStr}.
+                </p>
               </div>
             )}
 
-            {/* Local Words Inspection */}
-            {myScoredWords.length > 0 && (
+            {/* Word Breakdown */}
+            {scoredWords.length > 0 && (
               <div className="text-left">
                 <span className="text-xs font-semibold text-slate-400 block mb-1.5">
-                  Your Word Breakdown (Tap any for definition):
+                  Your Played Words (Tap to inspect definitions):
                 </span>
                 <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto">
-                  {myScoredWords.map(w => (
+                  {scoredWords.map(w => (
                     <button
                       key={w.word}
                       onClick={() => inspectWord(w.word)}
@@ -1084,47 +1318,675 @@ export default function App() {
               </div>
             )}
 
-            {/* Action Buttons */}
-            <div className="flex gap-3">
-              {gameMode === 'P2P_HOST' ? (
+            {/* SPONSOR BANNER */}
+            <AdBanner compact />
+
+            {/* Actions */}
+            <div className="flex flex-col sm:flex-row gap-3">
+              {gameModeType === 'DAILY_QUEST' ? (
+                <>
+                  <button
+                    onClick={() => {
+                      sounds.playClick();
+                      setSelectedRankingDate(todayDateStr);
+                      setActiveTab('DAILY_RANKINGS');
+                      setPlayState('LOBBY');
+                    }}
+                    className="flex-1 py-3.5 rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-display font-extrabold text-sm uppercase tracking-wider cursor-pointer active:translate-y-0.5"
+                  >
+                    View Global Rankings
+                  </button>
+                  <button
+                    onClick={launchDailyGame}
+                    className="py-3 px-4 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs uppercase tracking-wider cursor-pointer"
+                  >
+                    Practice Again
+                  </button>
+                </>
+              ) : (
                 <button
-                  onClick={handleHostStartGame}
+                  onClick={() => {
+                    setActiveTab('PARTY_RUSH');
+                    setPlayState('LOBBY');
+                  }}
                   className="flex-1 py-3.5 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-display font-extrabold text-sm uppercase tracking-wider cursor-pointer active:translate-y-0.5"
                 >
-                  Start Next Round
+                  Return to Party Lobby
                 </button>
-              ) : gameMode === 'SOLO' ? (
-                <button
-                  onClick={startSoloSprint}
-                  className="flex-1 py-3.5 rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-display font-extrabold text-sm uppercase tracking-wider cursor-pointer active:translate-y-0.5"
-                >
-                  Play Again
-                </button>
-              ) : (
-                <div className="flex-1 text-center text-xs text-slate-400 py-3 bg-[#0d1322] rounded-2xl border border-slate-800">
-                  Waiting for host to start next round...
-                </div>
               )}
               <button
-                onClick={returnToMenu}
-                className="py-3 px-5 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs cursor-pointer"
+                onClick={() => {
+                  sounds.playClick();
+                  if (p2pMode !== 'IDLE') handleLeaveRoom();
+                  setActiveTab('HOME');
+                  setPlayState('LOBBY');
+                }}
+                className="py-3 px-5 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
               >
-                Menu
+                <Home className="w-4 h-4 text-amber-400" />
+                <span>Back to Home</span>
               </button>
             </div>
           </div>
         )}
 
+        {/* ---------------------------------------------------- */}
+        {/* VIEW 4: MULTIPLAYER PARTY RUSH LOBBY */}
+        {/* ---------------------------------------------------- */}
+        {activeTab === 'PARTY_RUSH' && playState === 'LOBBY' && (
+          <div className="bg-[#141c30] border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-lg mx-auto space-y-6 shadow-2xl">
+            {/* Top Bar Return to Home */}
+            <div className="flex items-center justify-between border-b border-slate-800/80 pb-3">
+              <button
+                onClick={() => {
+                  sounds.playClick();
+                  handleLeaveRoom();
+                  setActiveTab('HOME');
+                  setPlayState('LOBBY');
+                }}
+                className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-400 hover:text-amber-400 transition-colors cursor-pointer"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                <span>Back to Home</span>
+              </button>
+              <span className="text-[11px] font-bold text-cyan-400 uppercase tracking-wider">
+                Party Rush
+              </span>
+            </div>
+
+            <div className="text-center">
+              <span className="text-xs font-bold text-cyan-400 uppercase tracking-wider">Simultaneous Multiplayer</span>
+              <h2 className="text-2xl sm:text-3xl font-display font-extrabold text-white mt-1">Party Word Rush</h2>
+              <p className="text-slate-400 text-xs sm:text-sm mt-1">
+                Up to 12 players simultaneously. Everyone races against the same 120s timer on their own phone or laptop!
+              </p>
+            </div>
+
+            {/* Profile Avatar & Nickname */}
+            <div className="bg-[#0b101d] p-3 rounded-2xl border border-slate-800 flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  sounds.playClick();
+                  const cur = AVATAR_OPTIONS.indexOf(playerAvatar);
+                  setPlayerAvatar(AVATAR_OPTIONS[(cur + 1) % AVATAR_OPTIONS.length]);
+                }}
+                className="w-10 h-10 rounded-xl bg-slate-800 flex items-center justify-center text-xl shrink-0 cursor-pointer"
+                title="Tap to change avatar"
+              >
+                {playerAvatar}
+              </button>
+              <div className="flex-1">
+                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Your Nickname</label>
+                <input
+                  type="text"
+                  maxLength={14}
+                  value={playerName}
+                  onChange={e => setPlayerName(e.target.value)}
+                  className="w-full bg-transparent border-none text-white font-bold text-sm focus:outline-none"
+                />
+              </div>
+            </div>
+
+            {/* Mode: Idle / Host / Guest */}
+            {p2pMode === 'IDLE' && (
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  onClick={handleHostCreateRoom}
+                  className="py-4 px-4 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-display font-extrabold text-sm uppercase tracking-wider cursor-pointer shadow-lg shadow-cyan-500/20 active:translate-y-0.5"
+                >
+                  Create Room (Host)
+                </button>
+                <button
+                  onClick={() => setP2PMode('GUEST')}
+                  className="py-4 px-4 rounded-2xl bg-slate-800 hover:bg-slate-700 text-cyan-300 font-display font-extrabold text-sm uppercase tracking-wider cursor-pointer active:translate-y-0.5"
+                >
+                  Join with Code
+                </button>
+              </div>
+            )}
+
+            {/* HOST VIEW */}
+            {p2pMode === 'HOST' && (
+              <div className="space-y-4">
+                <div className="bg-[#0b101d] border-2 border-cyan-500/40 rounded-2xl p-4 text-center">
+                  <span className="text-[10px] text-cyan-400 uppercase font-bold tracking-widest block mb-1">Room Code</span>
+                  <span className="text-4xl font-display font-black tracking-widest text-white">
+                    {roomCode}
+                  </span>
+                  <button
+                    onClick={copyRoomCode}
+                    className="mt-3 px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 text-xs font-semibold flex items-center gap-1.5 mx-auto cursor-pointer"
+                  >
+                    <Copy className="w-3.5 h-3.5" /> Copy Code
+                  </button>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between text-xs text-slate-400 font-semibold mb-2 px-1">
+                    <span>Joined Players ({players.length}/12)</span>
+                    <span>{p2pStatus}</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 max-h-40 overflow-y-auto">
+                    {players.map(p => (
+                      <div key={p.id} className="bg-[#0e1424] p-2 rounded-xl border border-slate-800 flex items-center gap-2">
+                        <span className="text-lg">{p.avatar}</span>
+                        <span className="text-xs font-bold text-white truncate">{p.name}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    onClick={handleHostStartGame}
+                    className="flex-1 py-3.5 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-display font-extrabold text-sm uppercase tracking-wider cursor-pointer shadow-lg shadow-cyan-500/20 active:translate-y-0.5"
+                  >
+                    Start 120s Simultaneous Sprint!
+                  </button>
+                  <button
+                    onClick={handleLeaveRoom}
+                    className="py-3 px-4 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs cursor-pointer"
+                  >
+                    Back
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* GUEST VIEW */}
+            {p2pMode === 'GUEST' && (
+              <>
+                {isGuestConnected ? (
+                  /* GUEST CONNECTED LOBBY VIEW */
+                  <div className="space-y-4">
+                    <div className="bg-[#0b101d] border-2 border-cyan-500/40 rounded-2xl p-4 text-center">
+                      <span className="text-[10px] text-cyan-400 uppercase font-bold tracking-widest block mb-1">Connected Room Code</span>
+                      <span className="text-4xl font-display font-black tracking-widest text-white">
+                        {roomCode}
+                      </span>
+                      <button
+                        onClick={copyRoomCode}
+                        className="mt-3 px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 text-xs font-semibold flex items-center gap-1.5 mx-auto cursor-pointer"
+                      >
+                        <Copy className="w-3.5 h-3.5" /> Copy Code
+                      </button>
+                    </div>
+
+                    <div className="bg-cyan-500/10 border border-cyan-500/30 rounded-2xl p-3.5 text-center">
+                      <div className="flex items-center justify-center gap-2 text-cyan-300 font-bold text-xs">
+                        <RefreshCw className="w-4 h-4 animate-spin text-cyan-400" />
+                        <span>Waiting for host to start sprint...</span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 mt-1">
+                        All players race simultaneously when the host clicks Start.
+                      </p>
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between text-xs text-slate-400 font-semibold mb-2 px-1">
+                        <span>Joined Players ({players.length}/12)</span>
+                        <span className="text-emerald-400 font-medium">Ready in Room</span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 max-h-40 overflow-y-auto">
+                        {players.map(p => (
+                          <div key={p.id} className="bg-[#0e1424] p-2 rounded-xl border border-slate-800 flex items-center gap-2">
+                            <span className="text-lg">{p.avatar}</span>
+                            <span className="text-xs font-bold text-white truncate">
+                              {p.name} {p.id === myPlayerId && '(You)'}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <button
+                      onClick={handleLeaveRoom}
+                      className="w-full py-3 rounded-2xl bg-slate-800 hover:bg-rose-950/60 hover:border-rose-500/50 border border-slate-700 text-rose-300 font-bold text-xs cursor-pointer active:translate-y-0.5 transition-colors"
+                    >
+                      Leave Room
+                    </button>
+                  </div>
+                ) : (
+                  /* GUEST CONNECTING / ENTER CODE FORM */
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">
+                        Enter 4-Letter Room Code
+                      </label>
+                      <input
+                        type="text"
+                        maxLength={4}
+                        value={joinCodeInput}
+                        onChange={e => setJoinCodeInput(e.target.value.toUpperCase())}
+                        placeholder="ROOM CODE"
+                        disabled={p2pStatus.includes('Connecting')}
+                        className="w-full text-center text-3xl font-display font-black tracking-widest bg-[#0b101d] border-2 border-slate-700 focus:border-cyan-400 rounded-2xl p-3 text-white uppercase outline-none"
+                      />
+                    </div>
+
+                    <div className="flex gap-2">
+                      <button
+                        onClick={handleGuestJoinRoom}
+                        disabled={p2pStatus.includes('Connecting')}
+                        className="flex-1 py-3.5 rounded-2xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-60 text-slate-950 font-display font-extrabold text-sm uppercase tracking-wider cursor-pointer shadow-lg shadow-cyan-500/20 active:translate-y-0.5 flex items-center justify-center gap-2"
+                      >
+                        {p2pStatus.includes('Connecting') && <RefreshCw className="w-4 h-4 animate-spin" />}
+                        <span>{p2pStatus.includes('Connecting') ? 'Connecting...' : 'Connect & Join'}</span>
+                      </button>
+                      <button
+                        onClick={handleLeaveRoom}
+                        className="py-3 px-4 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+
+                    {p2pStatus && (
+                      <p className="text-center text-xs text-cyan-300 font-semibold animate-pulse">{p2pStatus}</p>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ---------------------------------------------------- */}
+        {/* VIEW 5: DAILY RANKINGS (FIRESTORE CLOUD LEADERBOARD) */}
+        {/* ---------------------------------------------------- */}
+        {activeTab === 'DAILY_RANKINGS' && playState === 'LOBBY' && (
+          <div className="bg-[#141c30] border border-slate-800 rounded-3xl p-4 sm:p-7 max-w-3xl mx-auto space-y-5 shadow-2xl">
+            {/* Top Bar Return to Home */}
+            <div className="flex items-center justify-between border-b border-slate-800/80 pb-3">
+              <button
+                onClick={() => {
+                  sounds.playClick();
+                  setActiveTab('HOME');
+                  setPlayState('LOBBY');
+                }}
+                className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-400 hover:text-amber-400 transition-colors cursor-pointer"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                <span>Back to Home</span>
+              </button>
+              <span className="text-[11px] font-bold text-orange-400 uppercase tracking-wider flex items-center gap-1">
+                <Trophy className="w-3.5 h-3.5 text-yellow-400" /> Leaderboard
+              </span>
+            </div>
+
+            {/* Header & Date Controls */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-4">
+              <div>
+                <span className="text-xs font-bold text-orange-400 uppercase tracking-wider flex items-center gap-1.5">
+                  <Trophy className="w-4 h-4 text-yellow-400" /> Global Daily Leaderboard
+                </span>
+                <h2 className="text-2xl font-display font-extrabold text-white mt-0.5">
+                  Daily Word Champions
+                </h2>
+              </div>
+
+              {/* Date Switcher */}
+              <div className="flex items-center gap-2">
+                <input
+                  type="date"
+                  value={selectedRankingDate}
+                  onChange={e => setSelectedRankingDate(e.target.value)}
+                  className="bg-[#0b101d] border border-slate-700 focus:border-orange-500 text-white text-xs font-bold px-3 py-1.5 rounded-xl outline-none"
+                />
+                <button
+                  onClick={() => loadLeaderboard(selectedRankingDate)}
+                  disabled={isLoadingLeaderboard}
+                  className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white cursor-pointer"
+                  title="Refresh Leaderboard"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isLoadingLeaderboard ? 'animate-spin' : ''}`} />
+                </button>
+              </div>
+            </div>
+
+            {/* PINNED USER RANK (IF SIGNED IN & PLAYED) */}
+            {user && (
+              <div className="bg-gradient-to-r from-amber-500/20 via-orange-500/10 to-transparent border-2 border-amber-500/60 rounded-2xl p-3 flex items-center justify-between">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-full bg-amber-500 text-slate-950 font-black flex items-center justify-center font-display text-sm">
+                    {myLeaderboardEntry ? `#${myLeaderboardEntry.rank}` : '—'}
+                  </div>
+                  <div>
+                    <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                      {user.displayName} (You)
+                      {myLeaderboardEntry && <span className="text-[10px] bg-amber-500/30 text-amber-300 px-1.5 py-0.2 rounded font-normal">Ranked</span>}
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      {myLeaderboardEntry 
+                        ? `Best: ${myLeaderboardEntry.bestWord} · ${myLeaderboardEntry.wordCount} words` 
+                        : hasCompletedToday ? 'Score saved to device' : 'No official attempt logged for this date'}
+                    </span>
+                  </div>
+                </div>
+                <div className="text-right">
+                  <span className="text-xl font-display font-black text-amber-400 tabular-nums">
+                    {myLeaderboardEntry ? `${myLeaderboardEntry.score} pts` : '0 pts'}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* PODIUM OF TOP PLAYERS */}
+            {dailyLeaderboard.length > 0 && (
+              <div className={`grid ${
+                dailyLeaderboard.length === 1 
+                  ? 'grid-cols-1 max-w-xs mx-auto' 
+                  : dailyLeaderboard.length === 2 
+                    ? 'grid-cols-2 max-w-md mx-auto' 
+                    : 'grid-cols-3'
+              } gap-2 items-end pt-2 pb-2 text-center`}>
+                {/* 2nd Place Silver (if >= 2 players) */}
+                {dailyLeaderboard.length >= 2 && (
+                  <div className={`bg-[#0e1424] p-3 rounded-2xl border border-slate-700/80 flex flex-col items-center ${
+                    dailyLeaderboard.length >= 3 ? 'order-1' : 'order-2'
+                  }`}>
+                    <span className="text-xl mb-1">🥈</span>
+                    <span className="text-xs font-bold text-slate-200 truncate max-w-full">
+                      {dailyLeaderboard[1].displayName}
+                    </span>
+                    <span className="text-base font-display font-black text-slate-300 mt-0.5">
+                      {dailyLeaderboard[1].score} pts
+                    </span>
+                    <span className="text-[9px] text-slate-400 block mt-0.5 truncate">
+                      Best: {dailyLeaderboard[1].bestWord}
+                    </span>
+                  </div>
+                )}
+
+                {/* 1st Place Gold */}
+                <div className={`bg-gradient-to-b from-amber-500/20 to-orange-500/10 p-3.5 rounded-2xl border-2 border-amber-500 shadow-xl flex flex-col items-center -translate-y-2 ${
+                  dailyLeaderboard.length >= 3 ? 'order-2' : 'order-1'
+                }`}>
+                  <span className="text-2xl mb-1">🥇</span>
+                  <span className="text-xs sm:text-sm font-black text-white truncate max-w-full">
+                    {dailyLeaderboard[0].displayName}
+                  </span>
+                  <span className="text-xl font-display font-black text-amber-400 mt-0.5">
+                    {dailyLeaderboard[0].score} pts
+                  </span>
+                  <span className="text-[9px] bg-amber-500 text-slate-950 font-extrabold px-2 py-0.2 rounded-full uppercase mt-1">
+                    Daily Leader
+                  </span>
+                </div>
+
+                {/* 3rd Place Bronze (if >= 3 players) */}
+                {dailyLeaderboard.length >= 3 && (
+                  <div className="bg-[#0e1424] p-3 rounded-2xl border border-slate-700/80 flex flex-col items-center order-3">
+                    <span className="text-xl mb-1">🥉</span>
+                    <span className="text-xs font-bold text-slate-200 truncate max-w-full">
+                      {dailyLeaderboard[2].displayName}
+                    </span>
+                    <span className="text-base font-display font-black text-amber-600 mt-0.5">
+                      {dailyLeaderboard[2].score} pts
+                    </span>
+                    <span className="text-[9px] text-slate-400 block mt-0.5 truncate">
+                      Best: {dailyLeaderboard[2].bestWord}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* FULL TOP 50 TABLE */}
+            <div className="bg-[#0d1322] rounded-2xl border border-slate-800 overflow-hidden">
+              <div className="px-4 py-2.5 bg-slate-900/60 border-b border-slate-800 text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+                <span>Player & Ranking</span>
+                <span>Best Word · Score</span>
+              </div>
+
+              <div className="divide-y divide-slate-800/60 max-h-72 overflow-y-auto">
+                {dailyLeaderboard.length === 0 ? (
+                  <div className="p-8 text-center text-slate-500 text-xs">
+                    {isLoadingLeaderboard ? 'Loading Daily Scores from Firestore...' : 'No official scores recorded for this date yet. Be the first to play!'}
+                  </div>
+                ) : (
+                  dailyLeaderboard.map((entry) => (
+                    <div 
+                      key={entry.uid} 
+                      className={`px-4 py-2.5 flex items-center justify-between text-xs transition-colors ${
+                        entry.isMe ? 'bg-amber-500/10 font-bold' : 'hover:bg-slate-800/40'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5 truncate">
+                        <span className={`w-5 text-center font-bold ${
+                          entry.rank === 1 ? 'text-yellow-400' : entry.rank === 2 ? 'text-slate-300' : entry.rank === 3 ? 'text-amber-600' : 'text-slate-500'
+                        }`}>
+                          #{entry.rank}
+                        </span>
+                        {entry.photoURL ? (
+                          <img 
+                            src={entry.photoURL} 
+                            alt={entry.displayName} 
+                            referrerPolicy="no-referrer"
+                            className="w-5 h-5 rounded-full object-cover shrink-0" 
+                          />
+                        ) : (
+                          <div className="w-5 h-5 rounded-full bg-slate-800 text-[10px] flex items-center justify-center font-bold text-slate-400 shrink-0">
+                            {entry.displayName.charAt(0)}
+                          </div>
+                        )}
+                        <span className="text-white truncate max-w-[120px] sm:max-w-[180px]">
+                          {entry.displayName} {entry.isMe && '(You)'}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-4 text-right">
+                        <span className="text-slate-400 text-[11px] hidden sm:inline">
+                          Best: <span className="text-emerald-400 font-semibold">{entry.bestWord}</span>
+                        </span>
+                        <span className="font-display font-extrabold text-amber-400 tabular-nums">
+                          {entry.score} pts
+                        </span>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            {/* Bottom Play CTA */}
+            <button
+              onClick={handleStartDailyChallenge}
+              className="w-full py-3.5 rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-display font-extrabold text-sm uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer shadow-lg shadow-orange-500/20 active:translate-y-0.5"
+            >
+              <Play className="w-4 h-4 fill-current" />
+              <span>{hasCompletedToday ? 'Practice Today\'s Challenge' : 'Play Today\'s Challenge'}</span>
+            </button>
+
+            {/* SPONSOR BANNER IN RANKINGS */}
+            <AdBanner compact />
+          </div>
+        )}
+
       </main>
 
+      {/* FLOATING TOAST / FEEDBACK BANNER */}
+      {inputFeedback && (
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 max-w-md w-[92%] pointer-events-none animate-in fade-in slide-in-from-top-4 duration-200">
+          <div className={`p-3.5 rounded-2xl shadow-2xl border flex items-center justify-between gap-3 pointer-events-auto backdrop-blur-md ${
+            inputFeedback.isError 
+              ? 'bg-rose-950/95 border-rose-500/80 text-rose-100 shadow-rose-950/50' 
+              : 'bg-emerald-950/95 border-emerald-500/80 text-emerald-100 shadow-emerald-950/50'
+          }`}>
+            <div className="flex items-center gap-2.5 min-w-0">
+              {inputFeedback.isError ? (
+                <div className="w-7 h-7 rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center shrink-0">
+                  <AlertTriangle className="w-4 h-4" />
+                </div>
+              ) : (
+                <div className="w-7 h-7 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0">
+                  <CheckCircle2 className="w-4 h-4" />
+                </div>
+              )}
+              <span className="text-xs sm:text-sm font-bold leading-snug break-words">
+                {inputFeedback.message}
+              </span>
+            </div>
+            <button
+              onClick={() => setInputFeedback(null)}
+              className="text-slate-400 hover:text-white p-1 rounded-lg shrink-0 cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* FOOTER */}
-      <footer className="w-full py-3 px-4 border-t border-slate-800/80 bg-[#0d1322] text-center text-xs text-slate-500">
-        WordSpark: Brainy English Party · 1–12 Simultaneous Players · 2,600+ Word Lexicon
+      <footer className="w-full py-3 px-4 border-t border-slate-800/80 bg-[#0d1322] text-center text-xs text-slate-500 flex flex-wrap items-center justify-center gap-x-2 gap-y-1">
+        <span>WordSpark: Brainy English Party · Deterministic Daily Quest · Firestore Global Rankings</span>
+        {isOwnerAdmin && (
+          <>
+            <span>·</span>
+            <button
+              onClick={() => {
+                sounds.playClick();
+                setShowAffiliateModal(true);
+              }}
+              className="text-emerald-400 hover:text-emerald-300 font-semibold underline underline-offset-2 cursor-pointer transition-colors"
+              title="Configure custom affiliate links and view earnings analytics (Visible only to Admin/Owner)"
+            >
+              Affiliate & Sponsor Setup ⚡ (Admin)
+            </button>
+          </>
+        )}
       </footer>
 
       {/* ======================================================== */}
       {/* 3. MODALS */}
       {/* ======================================================== */}
+
+      {/* SIGN IN WITH GOOGLE / AUTH PROMPT MODAL */}
+      {showSignInModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-[#141c30] border border-amber-500/40 rounded-3xl p-6 sm:p-7 max-w-md w-full shadow-2xl relative space-y-4 animate-in fade-in zoom-in-95">
+            <button
+              onClick={() => {
+                setShowSignInModal(false);
+                setAuthErrorDetail(null);
+              }}
+              className="absolute top-5 right-5 text-slate-400 hover:text-white p-1 rounded-lg bg-slate-800/80 cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+
+            <div className="text-center">
+              <div className="w-12 h-12 rounded-2xl bg-amber-500/20 text-amber-400 flex items-center justify-center mx-auto mb-2">
+                <Trophy className="w-6 h-6" />
+              </div>
+              <h3 className="text-xl sm:text-2xl font-display font-extrabold text-white">
+                Player Sign-In & Rankings
+              </h3>
+              <p className="text-slate-400 text-xs mt-1">
+                Sign in with Google or create an instant player profile to log your Daily Challenge score to the global leaderboard.
+              </p>
+            </div>
+
+            {/* Diagnostic Alert Banner if Auth Issue Occurred */}
+            {authErrorDetail && (
+              <div className="bg-amber-950/40 border border-amber-500/50 rounded-2xl p-3.5 text-left text-xs space-y-2 animate-in fade-in duration-150">
+                <div className="flex items-center gap-2 font-bold text-amber-300">
+                  <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400" />
+                  <span>{authErrorDetail.title}</span>
+                </div>
+                <p className="text-slate-300 leading-relaxed text-[11px]">
+                  {authErrorDetail.message}
+                </p>
+                {authErrorDetail.domain && (
+                  <div className="bg-[#0b101d] p-2 rounded-xl border border-slate-800 flex items-center justify-between text-[11px] gap-2">
+                    <span className="text-slate-400 text-[10px] uppercase font-bold shrink-0">Domain:</span>
+                    <code className="text-amber-400 font-mono text-[10px] truncate flex-1">{authErrorDetail.domain}</code>
+                    <button
+                      onClick={() => {
+                        navigator.clipboard?.writeText(authErrorDetail.domain || '');
+                        triggerInputSuccess('Domain copied! Add to Firebase Authorized Domains.');
+                      }}
+                      className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-bold cursor-pointer shrink-0"
+                    >
+                      Copy
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="space-y-3 pt-1">
+              {/* Google Sign In Button */}
+              <button
+                onClick={handleDirectGoogleSignIn}
+                disabled={isSigningIn}
+                className="w-full py-3 px-4 rounded-xl bg-white hover:bg-slate-100 disabled:opacity-60 text-slate-900 font-bold text-xs sm:text-sm flex items-center justify-center gap-2.5 cursor-pointer shadow-lg active:translate-y-0.5 transition-all"
+              >
+                {isSigningIn ? (
+                  <RefreshCw className="w-4 h-4 animate-spin text-slate-700" />
+                ) : (
+                  <svg className="w-4 h-4" viewBox="0 0 24 24">
+                    <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"/>
+                    <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.33 24 12 24z"/>
+                    <path fill="#FBBC05" d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.18 0 10.04 0 12s.45 3.82 1.25 5.42l4.03-3.15z"/>
+                    <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"/>
+                  </svg>
+                )}
+                <span>Sign in with Google</span>
+              </button>
+
+              {/* Instant Account Profile Setup */}
+              <div className="bg-[#0e1424] p-3 rounded-2xl border border-slate-800 space-y-2.5">
+                <div className="flex items-center justify-between text-[11px] font-bold text-amber-400">
+                  <span className="flex items-center gap-1.5">
+                    <Zap className="w-3.5 h-3.5 text-amber-400" /> Instant Player Account
+                  </span>
+                  <span className="text-slate-500 font-normal">Works offline & in iframe</span>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded-lg bg-slate-800 flex items-center justify-center text-base shrink-0 border border-slate-700">
+                    🐼
+                  </div>
+                  <input
+                    type="text"
+                    maxLength={16}
+                    value={customAccountName}
+                    onChange={e => setCustomAccountName(e.target.value)}
+                    placeholder="Enter your nickname..."
+                    className="flex-1 bg-[#0b101d] border border-slate-700 focus:border-amber-400 rounded-xl px-3 py-1.5 text-xs text-white font-bold outline-none"
+                  />
+                </div>
+
+                <button
+                  onClick={() => {
+                    handleInstantSignIn(customAccountName);
+                    launchDailyGame();
+                  }}
+                  className="w-full py-2.5 px-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-black text-xs uppercase tracking-wider flex items-center justify-center gap-1.5 shadow-md shadow-amber-500/20 cursor-pointer active:translate-y-0.5"
+                >
+                  <Play className="w-3 h-3 fill-current" />
+                  <span>Play as {customAccountName.trim() || 'Player'}</span>
+                </button>
+              </div>
+
+              {/* Guest / Unranked Practice */}
+              <button
+                onClick={() => {
+                  sounds.playClick();
+                  setShowSignInModal(false);
+                  setAuthErrorDetail(null);
+                  launchDailyGame();
+                }}
+                className="w-full text-center text-xs text-slate-500 hover:text-slate-400 py-1 cursor-pointer"
+              >
+                Practice as Guest (Scores not recorded)
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* WORD DEFINITION POPUP */}
       {showDefinitionModal && (
@@ -1183,8 +2045,8 @@ export default function App() {
 
       {/* RULES MODAL */}
       {showRulesModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-[#141c30] border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-lg w-full shadow-2xl relative space-y-4 max-h-[90vh] overflow-y-auto">
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-[#141c30] border border-slate-700/80 rounded-3xl p-6 sm:p-7 max-w-lg w-full shadow-2xl relative space-y-4 max-h-[90vh] overflow-y-auto">
             <button
               onClick={() => setShowRulesModal(false)}
               className="absolute top-5 right-5 text-slate-400 hover:text-white p-1 rounded-lg bg-slate-800/80 cursor-pointer"
@@ -1192,114 +2054,117 @@ export default function App() {
               <X className="w-4 h-4" />
             </button>
 
-            <h3 className="text-2xl font-display font-bold text-white flex items-center gap-2">
-              <HelpCircle className="w-6 h-6 text-amber-400" /> How to Play Simultaneous Word Rush
-            </h3>
-
-            <div className="space-y-3.5 text-xs sm:text-sm text-slate-300 leading-relaxed">
-              <div className="bg-[#0d1322] p-3.5 rounded-2xl border border-slate-800 space-y-1">
-                <span className="font-bold text-amber-400 block text-sm">1. Simultaneous 120s Sprint</span>
-                <p>
-                  Every round lasts exactly 120 seconds (2 minutes). All 1 to 12 players type words simultaneously on their own screen with zero waiting or turn locking!
-                </p>
-              </div>
-
-              <div className="bg-[#0d1322] p-3.5 rounded-2xl border border-slate-800 space-y-1">
-                <span className="font-bold text-orange-400 block text-sm">2. Scoring System</span>
-                <p>• <strong>3–4 letter word</strong>: 10 pts</p>
-                <p>• <strong>5–6 letter word</strong>: 25 pts</p>
-                <p>• <strong>7+ letter word</strong>: 50 pts</p>
-                <p>• <strong>Board Challenge Match</strong>: +20 bonus pts each time your word matches an active prompt!</p>
-              </div>
-
-              <div className="bg-[#0d1322] p-3.5 rounded-2xl border border-slate-800 space-y-1">
-                <span className="font-bold text-cyan-400 block text-sm">3. Live Leaderboard & Podiums</span>
-                <p>
-                  Scores sync in real-time across devices. When the referee whistle blows at 0s, the podium crowns 1st, 2nd, and 3rd place champions!
-                </p>
-              </div>
+            <div>
+              <h3 className="text-2xl font-display font-extrabold text-white flex items-center gap-2">
+                <HelpCircle className="w-6 h-6 text-amber-400" /> How to Play WordSpark
+              </h3>
+              <p className="text-xs text-slate-400 mt-1">
+                Fast-paced vocabulary rush for solo wordsmiths and multiplayer party rooms.
+              </p>
             </div>
 
-            <button
-              onClick={() => setShowRulesModal(false)}
-              className="w-full py-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs uppercase tracking-wider cursor-pointer"
-            >
-              Ready to Rush!
-            </button>
-          </div>
-        </div>
-      )}
+            <div className="space-y-3 text-xs sm:text-sm text-slate-300 leading-relaxed">
+              {/* Rule 1: English Nouns Only */}
+              <div className="bg-[#0d1322] p-3.5 rounded-2xl border border-amber-500/40 space-y-2">
+                <div className="flex items-center gap-2 font-bold text-amber-300 text-sm">
+                  <ShieldCheck className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>Strict Rule: Valid English NOUNS Only</span>
+                </div>
+                <p className="text-[12px] text-slate-300 leading-relaxed">
+                  Every submitted word must be a verified English <strong>NOUN</strong> (person, place, thing, animal, or abstract concept).
+                </p>
+                <div className="bg-[#101728] p-2.5 rounded-xl border border-slate-800 text-[11px] space-y-1">
+                  <p className="text-emerald-300">
+                    <span className="font-bold">✓ Accepted:</span> PLANET, CASTLE, HARMONY, COFFEE, GALAXY, TIGER
+                  </p>
+                  <p className="text-cyan-300">
+                    <span className="font-bold">✓ Plurals:</span> CITIES, TREES, CHILDREN, WOLVES, HEROES
+                  </p>
+                  <p className="text-rose-300">
+                    <span className="font-bold">✗ Rejected:</span> Verbs (RUN, FLY), Adjectives (FAST, BRAVE), Adverbs (QUICKLY), and Prepositions (UNDER)
+                  </p>
+                </div>
+              </div>
 
-      {/* SCORES & LEXICON MODAL */}
-      {showHighScoresModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-[#141c30] border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-lg w-full shadow-2xl relative space-y-5 max-h-[90vh] overflow-y-auto">
-            <button
-              onClick={() => setShowHighScoresModal(false)}
-              className="absolute top-5 right-5 text-slate-400 hover:text-white p-1 rounded-lg bg-slate-800/80 cursor-pointer"
-            >
-              <X className="w-4 h-4" />
-            </button>
-
-            <h3 className="text-2xl font-display font-bold text-white flex items-center gap-2">
-              <Trophy className="w-6 h-6 text-yellow-400" /> High Scores & Dictionary
-            </h3>
-
-            {/* Solo High Scores Leaderboard */}
-            <div>
-              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-2">
-                Solo 120s Personal Best
-              </span>
-              <div className="bg-[#0d1322] rounded-2xl border border-slate-800 divide-y divide-slate-800/60">
-                {soloHighScores.map((score, idx) => (
-                  <div key={idx} className="flex items-center justify-between p-3 text-sm">
-                    <span className="font-bold text-slate-300 flex items-center gap-2">
-                      <span className="w-6 text-center text-xs text-amber-400">#{idx + 1}</span>
-                      Sprint Master
-                    </span>
-                    <span className="font-display font-bold text-amber-400 tabular-nums">
-                      {score} pts
-                    </span>
+              {/* Rule 2: Scoring Breakdown */}
+              <div className="bg-[#0d1322] p-3.5 rounded-2xl border border-slate-800 space-y-2">
+                <div className="flex items-center gap-2 font-bold text-orange-400 text-sm">
+                  <Award className="w-4 h-4 text-orange-400 shrink-0" />
+                  <span>Point Scoring System</span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-center text-xs">
+                  <div className="bg-[#121a2c] p-2 rounded-xl border border-slate-800">
+                    <span className="text-[10px] text-slate-400 block font-bold">3–4 Letters</span>
+                    <span className="font-display font-extrabold text-amber-400 text-sm">10 pts</span>
+                    <span className="text-[9px] text-slate-500 block">CAT, BIRD</span>
                   </div>
-                ))}
+                  <div className="bg-[#121a2c] p-2 rounded-xl border border-slate-800">
+                    <span className="text-[10px] text-slate-400 block font-bold">5–6 Letters</span>
+                    <span className="font-display font-extrabold text-amber-400 text-sm">25 pts</span>
+                    <span className="text-[9px] text-slate-500 block">PLANET, BRIDGE</span>
+                  </div>
+                  <div className="bg-[#121a2c] p-2 rounded-xl border border-slate-800">
+                    <span className="text-[10px] text-slate-400 block font-bold">7+ Letters</span>
+                    <span className="font-display font-extrabold text-amber-400 text-sm">50 pts</span>
+                    <span className="text-[9px] text-slate-500 block">ELEPHANT, CASTLE</span>
+                  </div>
+                </div>
+                <div className="bg-[#121a2c] p-2.5 rounded-xl border border-amber-500/20 text-[11px] text-amber-300/90 space-y-1">
+                  <p>
+                    <span className="font-bold text-amber-300">+20 Board Bonus:</span> Extra points for matching an active board constraint (Category, Starting Letters, Contains pattern, or Length).
+                  </p>
+                  <p>
+                    <span className="font-bold text-amber-300">+20 Daily Bonus Letter:</span> Extra points when your noun begins with the designated bonus letter of the day!
+                  </p>
+                </div>
               </div>
-            </div>
 
-            {/* Live Lexicon Lookup Tool */}
-            <div>
-              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-2">
-                Embedded English Lexicon (2,600+ Words)
-              </span>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={lexiconSearchQuery}
-                  onChange={e => setLexiconSearchQuery(e.target.value.toUpperCase())}
-                  placeholder="Look up any English word..."
-                  className="flex-1 bg-[#0d1322] border border-slate-700 focus:border-amber-400 rounded-xl px-3 py-2 text-white text-sm outline-none"
-                />
-                <button
-                  onClick={() => {
-                    if (lexiconSearchQuery.trim()) {
-                      inspectWord(lexiconSearchQuery.trim());
-                    }
-                  }}
-                  className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs uppercase rounded-xl cursor-pointer"
-                >
-                  Inspect
-                </button>
+              {/* Rule 3: Game Modes */}
+              <div className="bg-[#0d1322] p-3.5 rounded-2xl border border-slate-800 space-y-2.5">
+                <div className="flex items-center gap-2 font-bold text-cyan-400 text-sm">
+                  <Sparkles className="w-4 h-4 text-cyan-400 shrink-0" />
+                  <span>Game Modes</span>
+                </div>
+
+                <div className="space-y-1 text-xs">
+                  <span className="font-bold text-white block">1. Daily Word Quest (Solo)</span>
+                  <p className="text-[11px] text-slate-400">
+                    A shared deterministic 120-second challenge refreshed every midnight. Everyone gets the exact same board prompts. Your first run of the day logs your official ranked score to the Global Cloud Leaderboard. Unlimited practice runs thereafter!
+                  </p>
+                </div>
+
+                <div className="space-y-1 text-xs border-t border-slate-800/80 pt-2">
+                  <span className="font-bold text-white block">2. Party Rush (1–12 Players)</span>
+                  <p className="text-[11px] text-slate-400">
+                    Host or join via a 4-letter room code. All players race simultaneously on their own phones or computers with zero input lag. The shared leaderboard synchronizes live as players score!
+                  </p>
+                </div>
+              </div>
+
+              {/* Rule 4: Pro Tips */}
+              <div className="bg-[#0d1322] p-3 rounded-xl border border-slate-800 text-[11px] text-slate-400 space-y-1">
+                <span className="font-bold text-slate-300 block">Pro Tips:</span>
+                <p>• Words cannot be submitted twice in the same round.</p>
+                <p>• Aim for longer nouns matching multiple challenge prompts for huge score combos!</p>
+                <p>• Tap any played word on the Game Over screen to inspect phonetic syllables, definitions, and usage examples.</p>
               </div>
             </div>
 
             <button
-              onClick={() => setShowHighScoresModal(false)}
-              className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs uppercase tracking-wider cursor-pointer"
+              onClick={() => setShowRulesModal(false)}
+              className="w-full py-3 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-display font-extrabold text-xs uppercase tracking-wider cursor-pointer active:translate-y-0.5 shadow-lg shadow-amber-500/20"
             >
-              Close
+              Got it, let's play!
             </button>
           </div>
         </div>
       )}
+
+      {/* AFFILIATE MONETIZATION MANAGER MODAL */}
+      <AffiliateModal
+        isOpen={showAffiliateModal}
+        onClose={() => setShowAffiliateModal(false)}
+      />
 
     </div>
   );
